@@ -1,0 +1,15 @@
+data/*
+!data/.gitkeep
+!data/audio/
+!data/audio/.gitkeep
+!data/reference_speakers/
+!data/reference_speakers/.gitkeep
+!data/generation_logs/
+!data/generation_logs/.gitkeep
+__pycache__/
+*.pyc
+configs/runtime_generation_*.yaml
+configs/runtime_smoke_generation.yaml
+.env
+.env.*
+!.env.example

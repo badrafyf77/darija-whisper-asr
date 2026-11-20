@@ -1,0 +1,11 @@
+openai
+openai-whisper
+pyyaml
+tqdm
+pandas
+soundfile
+librosa
+numpy
+datasets
+jsonlines
+jiwer

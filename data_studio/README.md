@@ -1,0 +1,166 @@
+# Moroccan ASR Dataset Studio
+
+A local web tool for four workflows:
+
+- **Datasets Viewer**: load a server-side dataset path, choose a row preview limit, inspect rows, and play audio.
+- **Dataset Hub**: import datasets from the Hub, merge saved `hf_dataset` folders, resplit a dataset into train/test by hours, and push datasets back to Hugging Face.
+- **Darija Code-Switch Generator**: run a one-sample smoke test or launch the synthetic Darija/French/English dataset pipeline.
+- **Datasets Cleaner**: remove bad ASR samples, filter duration, add audio augmentation, normalize transcripts, then remove duplicate transcript rows.
+
+## Run The Studio
+
+Use `viewer_server.py`. The generator and server-side dataset loader do not work with plain `python3 -m http.server`.
+
+```bash
+cd data_studio
+python3 viewer_server.py --host 0.0.0.0 --port 8000
+```
+
+Then open your Lightning forwarded port URL.
+
+Confirm the backend is active:
+
+```text
+http://localhost:8000/api/server-info
+```
+
+It should return JSON with `synthetic-test`, `generation-jobs`, `hf-dataset-import`, `hf-dataset-merge`, and `hf-dataset-push` in `features`.
+
+## Datasets Viewer
+
+Open **Datasets Viewer**, set:
+
+- `Dataset path`: for example `/teamspace/studios/this_studio/darija_clean`
+- `Max rows per split`: `0` for all rows, or a preview limit like `2000`
+
+Then click **Load Dataset**.
+
+The viewer supports Hugging Face `save_to_disk` datasets and DatasetDict folders through the Python server. It shows split tables, row stats, exact-value filters for columns such as `language_mix`, searchable value lists, distribution bars, total/visible hours when a duration column is present, column controls, pagination, export, and inline audio when audio paths are available.
+
+## Dataset Hub
+
+Open **Dataset Hub** to pull a dataset directly from the Hub with **Import From Hugging Face**:
+
+- `Dataset repo id`: for example `owner/dataset-name`
+- `Subset/config`: optional, useful for datasets such as Common Voice language configs
+- `Split`: optional; leave empty to import all available splits
+- `Local folder`: optional; when empty, imports are saved under `synthetic_cs_dataset/data/hf_imports/`
+
+Click **Import Dataset**. The server downloads the dataset with `datasets.load_dataset`, saves it locally with `save_to_disk`, then loads the saved local path into the viewer. For private or gated datasets, set `HF_TOKEN` or authenticate with `huggingface-cli login` in the environment running `viewer_server.py`.
+
+After creating multiple `hf_dataset/` folders, use **Merge HF Datasets**. Put one `save_to_disk` folder path per line, choose the merged output folder, then click **Merge HF Datasets**. If you open the site from your laptop through a cloud forwarded port, these paths are still paths on the cloud machine running `viewer_server.py`.
+
+Use **Resplit Dataset** to re-divide a dataset by percentages. It merges every split (or the ones you list) into one pool, shuffles with a seed, then splits it so **Train %** and **Test %** match the requested ratio. The hours per split are computed automatically from the duration column, which is auto-detected; it can also update the `split` column so each row matches its new split. Run it after merging and before pushing.
+
+The **Push To Hugging Face** form can push any server-side `hf_dataset` path. Click **Load Columns** to choose which columns to upload; leaving the columns field empty pushes all columns.
+
+## Darija Code-Switch Generator
+
+Open **Darija Code-Switch Generator**.
+
+Use **Run 1-Sample Test** first. It creates:
+
+```text
+synthetic_cs_dataset/data/smoke_test/
+  texts.jsonl
+  metadata.csv
+  dataset.jsonl
+  audio/
+```
+
+For a full run, set the generation parameters and click **Generate Dataset**. The page polls the backend and shows a progress bar for text generation and audio generation. The default config now favors faster 5k-style runs: transcript batches run in parallel, and extra phone augmentation is off unless you raise its probability.
+
+## Datasets Cleaner
+
+Open **Datasets Cleaner**.
+
+Phase 1, **Bad Sample Removal**, removes rows that fail either check:
+
+- Whisper transcription CER above the threshold, default `0.6`
+- Transcript length outside the chars/sec range, default `5` to `22`
+
+Phase 2, **Duration Filtering**, keeps the default `1` to `30` second range and removes samples outside it, including clips under `0.7` seconds. It can read a duration column or fall back to measuring the audio column.
+
+Phase 3, **Data Augmentation**, appends augmented audio copies for selected real-data sources. The target extra percent controls added hours, so `50%` on a `40h` selected split aims for `20h` more audio. By default it leaves the include source filter empty and excludes `darija_codeswitch_asr`, your TTS source. It uses speed perturbation (`0.9x`/`1.1x`), synthetic background noise, room reverb, telephony degradation, and gain variation without pitch shifting or stacked effects.
+
+Phase 4, **Transcript Normalization**, applies `tools/best_asr_text_normalizer.py` to a transcript column. By default it writes a `normalized_text` column, preserving Darija in Arabic script and French/English code-switch words in Latin script.
+
+Phase 5, **Duplicate Text Removal**, removes repeated transcript rows and keeps the first occurrence. By default it normalizes spaces, casing, and simple punctuation before matching duplicate text.
+
+Choose **Save cleaned copy** and enter a new output folder, or choose **Override original dataset**. When a job finishes, the page shows the removed sample count, the saved dataset path, and a JSON report path with removal details.
+
+Install the cleaner dependencies in the same environment running `viewer_server.py`:
+
+```bash
+pip install -r synthetic_cs_dataset/requirements.txt
+```
+
+Before pushing, put your token in the cloud/server environment. The easiest project-local option is:
+
+```bash
+cp synthetic_cs_dataset/.env.example synthetic_cs_dataset/.env
+```
+
+Then edit `synthetic_cs_dataset/.env`:
+
+```bash
+HF_TOKEN=hf_...
+```
+
+You can also export it before starting `viewer_server.py`:
+
+```bash
+export HF_TOKEN=...
+```
+
+Or authenticate the same cloud environment with:
+
+```bash
+huggingface-cli login
+```
+
+Required before generation:
+
+```bash
+cp synthetic_cs_dataset/.env.example synthetic_cs_dataset/.env
+```
+
+Then edit `synthetic_cs_dataset/.env`:
+
+```bash
+LIGHTNING_API_KEY=...
+```
+
+The generator loads `synthetic_cs_dataset/.env` automatically. If you change the key while the web UI is running, restart `viewer_server.py`.
+
+Also make sure OmniVoice, torch, and the Python packages in `synthetic_cs_dataset/requirements.txt` are installed in the environment running `viewer_server.py`.
+
+## CLI Pipeline
+
+You can still run the synthetic pipeline directly:
+
+```bash
+cd synthetic_cs_dataset
+python scripts/generate_texts.py --config configs/generation.yaml
+python scripts/generate_audio.py --config configs/generation.yaml
+python scripts/validate_dataset.py --data_dir data/
+python scripts/make_hf_dataset.py --data_dir data/
+```
+
+One-sample CLI smoke test:
+
+```bash
+python scripts/run_smoke_test.py
+```
+
+See `synthetic_cs_dataset/README.md` for the config fields, speaker reference format, quality checks, and output layout.
+
+## Dataset Conversion Helper
+
+Browsers cannot read Parquet, Arrow, or Hugging Face `save_to_disk` folders directly without a conversion layer. If you need JSONL files for separate review or sharing, use:
+
+```bash
+python3 tools/prepare_for_viewer.py /path/to/your/datasets --out viewer_data --manifest viewer-manifest.json
+```
+
+For Parquet, install `pandas` and `pyarrow`. For Hugging Face datasets, install `datasets`.

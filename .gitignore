@@ -1,0 +1,22 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Training outputs and data (kept out of git)
+outputs/
+checkpoints/
+*.safetensors
+*.wav
+*.flac
+*.mp3
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,1616 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Moroccan ASR Dataset Studio</title>
+    <link rel="stylesheet" href="./styles.css?v=studio8" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Workspace navigation">
+        <header class="brand">
+          <div class="brand-mark" aria-hidden="true">ASR</div>
+          <div>
+            <h1>Moroccan ASR Studio</h1>
+            <p>Inspect datasets and generate Darija code-switch speech.</p>
+          </div>
+        </header>
+
+        <nav class="section-nav" aria-label="Main sections">
+          <button class="nav-button is-active" id="navViewer" type="button">
+            <span>Datasets Viewer</span>
+            <small>Load a dataset path and inspect rows</small>
+          </button>
+          <button class="nav-button" id="navHfHub" type="button">
+            <span>Dataset Hub</span>
+            <small>Import, merge, and publish datasets</small>
+          </button>
+          <button class="nav-button" id="navGenerator" type="button">
+            <span>Darija Code-Switch Generator</span>
+            <small>Create synthetic text and TTS audio</small>
+          </button>
+          <button class="nav-button" id="navCleaner" type="button">
+            <span>Datasets Cleaner</span>
+            <small>Remove samples that fail ASR checks</small>
+          </button>
+        </nav>
+
+        <section class="panel compact-panel">
+          <div class="panel-heading">
+            <h2>Server</h2>
+            <span
+              class="status-dot"
+              id="serverStatusDot"
+              aria-hidden="true"
+            ></span>
+          </div>
+          <p class="hint" id="serverInfoText">Checking backend features...</p>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <section class="message-panel" id="messagePanel" hidden>
+          <div>
+            <p class="eyebrow" id="messageType">Message</p>
+            <h2 id="messageTitle">Something needs attention</h2>
+            <p id="messageText"></p>
+            <pre id="messageDetails" hidden></pre>
+          </div>
+          <button
+            class="button secondary small"
+            id="messageClose"
+            type="button"
+          >
+            Dismiss
+          </button>
+        </section>
+
+        <section class="workspace-page" id="datasetPage">
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">Datasets Viewer</p>
+              <h2>Load a speech dataset from a server path.</h2>
+              <p>
+                Enter a Hugging Face `save_to_disk` folder or dataset directory,
+                choose a row limit, then inspect transcripts and audio in the
+                table.
+              </p>
+            </div>
+          </header>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Load Dataset</h2>
+            </div>
+            <form class="form-grid dataset-load-form" id="datasetLoadForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="datasetPathInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/darija_clean"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Max rows per split</span>
+                <input
+                  id="maxRowsInput"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value="2000"
+                />
+              </label>
+              <button
+                class="button primary"
+                id="loadDatasetButton"
+                type="submit"
+              >
+                Load Dataset
+              </button>
+            </form>
+          </section>
+
+          <section class="panel dataset-panel">
+            <div class="panel-heading">
+              <h2>Loaded Datasets</h2>
+              <span class="count-pill" id="datasetCount">0</span>
+            </div>
+            <div class="dataset-list" id="datasetList" aria-live="polite"></div>
+          </section>
+
+          <section class="viewer" id="viewer" hidden>
+            <header class="viewer-header">
+              <div>
+                <p class="eyebrow" id="datasetKind">Dataset</p>
+                <h2 id="datasetTitle">No dataset selected</h2>
+                <p id="datasetSubtitle"></p>
+              </div>
+              <button class="button primary" id="exportButton" type="button">
+                Export Filtered JSONL
+              </button>
+            </header>
+
+            <div
+              class="stats-grid"
+              id="statsGrid"
+              aria-label="Dataset stats"
+            ></div>
+
+            <div class="insights-grid">
+              <section class="panel facet-panel">
+                <div class="panel-heading">
+                  <h2>Exact Filters</h2>
+                  <button
+                    class="button subtle small"
+                    id="clearExactFilters"
+                    type="button"
+                  >
+                    Clear
+                  </button>
+                </div>
+                <div class="facet-controls">
+                  <label>
+                    <span>Column</span>
+                    <select id="facetColumn"></select>
+                  </label>
+                  <label>
+                    <span>Values</span>
+                    <select id="facetMode">
+                      <option value="exact">Exact cell</option>
+                      <option value="token">Items in cell</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Find</span>
+                    <input
+                      id="facetSearch"
+                      type="search"
+                      placeholder="Filter values..."
+                    />
+                  </label>
+                </div>
+                <div class="active-filters" id="activeFilters"></div>
+                <div class="facet-value-list" id="facetValueList"></div>
+              </section>
+
+              <section class="panel distribution-panel">
+                <div class="panel-heading">
+                  <h2>Distribution</h2>
+                </div>
+                <div class="distribution-controls">
+                  <label>
+                    <span>Column</span>
+                    <select id="distributionColumn"></select>
+                  </label>
+                  <label>
+                    <span>Metric</span>
+                    <select id="distributionMetric">
+                      <option value="count">Rows</option>
+                      <option value="hours">Hours</option>
+                    </select>
+                  </label>
+                </div>
+                <div
+                  class="distribution-chart"
+                  id="distributionChart"
+                  aria-live="polite"
+                ></div>
+              </section>
+            </div>
+
+            <div class="toolbar">
+              <label class="search-field">
+                <span>Search</span>
+                <input
+                  id="searchInput"
+                  type="search"
+                  placeholder="Text, speaker, path..."
+                />
+              </label>
+
+              <label>
+                <span>Rows</span>
+                <select id="pageSizeSelect">
+                  <option value="25">25</option>
+                  <option value="50" selected>50</option>
+                  <option value="100">100</option>
+                  <option value="250">250</option>
+                </select>
+              </label>
+
+              <label>
+                <span>Audio</span>
+                <select id="audioFilter">
+                  <option value="all">All rows</option>
+                  <option value="linked">Playable</option>
+                  <option value="missing">Missing</option>
+                </select>
+              </label>
+
+              <label>
+                <span>Column</span>
+                <select id="columnFocus">
+                  <option value="">All columns</option>
+                </select>
+              </label>
+            </div>
+
+            <details class="column-tools">
+              <summary>Columns</summary>
+              <div class="column-actions">
+                <button
+                  class="button subtle small"
+                  id="showAllColumns"
+                  type="button"
+                >
+                  Show All
+                </button>
+                <button
+                  class="button subtle small"
+                  id="hideLongColumns"
+                  type="button"
+                >
+                  Compact Text
+                </button>
+              </div>
+              <div class="column-toggles" id="columnToggles"></div>
+            </details>
+
+            <div class="table-shell">
+              <table class="data-table" id="dataTable">
+                <thead id="tableHead"></thead>
+                <tbody id="tableBody"></tbody>
+              </table>
+            </div>
+
+            <footer class="pagination">
+              <button class="button secondary" id="prevPage" type="button">
+                Previous
+              </button>
+              <span id="pageStatus">0 rows</span>
+              <button class="button secondary" id="nextPage" type="button">
+                Next
+              </button>
+            </footer>
+          </section>
+        </section>
+
+        <section class="workspace-page" id="hfHubPage" hidden>
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">Dataset Hub</p>
+              <h2>Import, merge, and publish Hugging Face datasets.</h2>
+              <p>
+                Pull datasets from the Hub, combine saved `hf_dataset` folders,
+                then push selected columns back to a dataset repository.
+              </p>
+            </div>
+          </header>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Import From Hugging Face</h2>
+            </div>
+            <form class="form-grid hf-import-form" id="hfImportForm">
+              <label class="wide-field">
+                <span>Dataset repo id</span>
+                <input
+                  id="hfImportRepoInput"
+                  type="text"
+                  placeholder="mozilla-foundation/common_voice_17_0"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Subset/config</span>
+                <input
+                  id="hfImportConfigInput"
+                  type="text"
+                  placeholder="ar"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Split</span>
+                <input
+                  id="hfImportSplitInput"
+                  type="text"
+                  placeholder="train"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Local folder</span>
+                <input
+                  id="hfImportOutputInput"
+                  type="text"
+                  placeholder="Leave empty for synthetic_cs_dataset/data/hf_imports/..."
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Revision</span>
+                <input
+                  id="hfImportRevisionInput"
+                  type="text"
+                  placeholder="main"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="checkbox-field">
+                <input id="hfImportOverwriteInput" type="checkbox" />
+                <span>Overwrite folder</span>
+              </label>
+              <label class="checkbox-field">
+                <input id="hfImportTrustRemoteCodeInput" type="checkbox" />
+                <span>Trust remote code</span>
+              </label>
+              <button
+                class="button primary"
+                id="importHfDatasetButton"
+                type="submit"
+              >
+                Import Dataset
+              </button>
+            </form>
+            <div class="progress-card" id="hfImportProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="hfImportProgressLabel">Waiting</strong>
+                <span id="hfImportProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="Hugging Face import progress"
+              >
+                <div class="progress-fill" id="hfImportProgressFill"></div>
+              </div>
+              <p class="hint" id="hfImportProgressDetails">
+                No import running.
+              </p>
+            </div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Merge HF Datasets</h2>
+            </div>
+            <form class="form-grid hf-merge-form" id="hfMergeForm">
+              <label class="wide-field">
+                <span>HF dataset paths</span>
+                <textarea id="hfDatasetPathsInput" rows="5" autocomplete="off">
+synthetic_cs_dataset/data_batch_01/hf_dataset
+synthetic_cs_dataset/data_batch_02/hf_dataset</textarea
+                >
+              </label>
+              <label class="wide-field">
+                <span>Merged output folder</span>
+                <input
+                  id="hfMergeOutputInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_merged/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Columns to keep (one per line)</span>
+                <textarea
+                  id="hfMergeColumnsInput"
+                  rows="4"
+                  placeholder="Leave empty to use common columns across all datasets"
+                  autocomplete="off"
+                ></textarea>
+              </label>
+              <button
+                class="button secondary"
+                id="detectMergeColumnsButton"
+                type="button"
+              >
+                Detect Common Columns
+              </button>
+              <label class="checkbox-field">
+                <input id="hfOverwriteInput" type="checkbox" />
+                <span>Overwrite output</span>
+              </label>
+              <button
+                class="button primary"
+                id="mergeHfDatasetsButton"
+                type="submit"
+              >
+                Merge HF Datasets
+              </button>
+            </form>
+
+            <div class="progress-card" id="hfMergeProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="hfMergeProgressLabel">Waiting</strong>
+                <span id="hfMergeProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="HF dataset merge progress"
+              >
+                <div class="progress-fill" id="hfMergeProgressFill"></div>
+              </div>
+              <p class="hint" id="hfMergeProgressDetails">No merge running.</p>
+            </div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Resplit Dataset</h2>
+            </div>
+            <form class="form-grid hf-split-form" id="hfSplitForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="hfSplitDatasetPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_merged/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Input splits (one per line)</span>
+                <textarea
+                  id="hfSplitIncludeSplitsInput"
+                  rows="3"
+                  placeholder="Leave empty to re-split every split in the dataset"
+                  autocomplete="off"
+                ></textarea>
+              </label>
+              <label>
+                <span>Train %</span>
+                <input
+                  id="hfSplitTrainPercentInput"
+                  type="number"
+                  min="1"
+                  max="99"
+                  step="1"
+                  value="90"
+                />
+              </label>
+              <label>
+                <span>Test %</span>
+                <input
+                  id="hfSplitTestPercentInput"
+                  type="number"
+                  min="1"
+                  max="99"
+                  step="1"
+                  value="10"
+                />
+                <small>
+                  Percentages set the train/test ratio; hours are computed
+                  automatically from the durations.
+                </small>
+              </label>
+              <label class="wide-field">
+                <span>Duration column</span>
+                <input
+                  id="hfSplitDurationColumnInput"
+                  type="text"
+                  placeholder="Auto-detect (e.g. duration_seconds)"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Random seed</span>
+                <input
+                  id="hfSplitSeedInput"
+                  type="number"
+                  step="1"
+                  value="42"
+                />
+              </label>
+              <label class="checkbox-field">
+                <input id="hfSplitUpdateSplitColumnInput" type="checkbox" checked />
+                <span>Update `split` column</span>
+              </label>
+              <label class="wide-field">
+                <span>Output folder</span>
+                <input
+                  id="hfSplitOutputInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_resplit/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="checkbox-field">
+                <input id="hfSplitOverwriteInput" type="checkbox" />
+                <span>Overwrite output folder</span>
+              </label>
+              <button
+                class="button primary"
+                id="resplitHfDatasetButton"
+                type="submit"
+              >
+                Resplit Dataset
+              </button>
+            </form>
+
+            <div class="progress-card" id="hfSplitProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="hfSplitProgressLabel">Waiting</strong>
+                <span id="hfSplitProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="Dataset resplit progress"
+              >
+                <div class="progress-fill" id="hfSplitProgressFill"></div>
+              </div>
+              <p class="hint" id="hfSplitProgressDetails">No resplit running.</p>
+            </div>
+
+            <div class="result-box" id="hfSplitResult" hidden></div>
+          </section>
+
+          <section class="panel form-panel" id="hfPushPanel">
+            <div class="panel-heading">
+              <h2>Push To Hugging Face</h2>
+            </div>
+            <form class="form-grid hf-push-form" id="hfPushForm">
+              <label class="wide-field">
+                <span>HF dataset path</span>
+                <input
+                  id="hfPushDatasetPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_merged/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Dataset repo id</span>
+                <input
+                  id="hfRepoIdInput"
+                  type="text"
+                  placeholder="username/darija-code-switch-asr"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Columns to push</span>
+                <textarea
+                  id="hfPushColumnsInput"
+                  rows="4"
+                  placeholder="Leave empty for all columns, or enter one column per line"
+                  autocomplete="off"
+                ></textarea>
+              </label>
+              <button
+                class="button secondary"
+                id="loadHfColumnsButton"
+                type="button"
+              >
+                Load Columns
+              </button>
+              <label class="checkbox-field">
+                <input id="hfPrivateRepoInput" type="checkbox" checked />
+                <span>Private repo</span>
+              </label>
+              <button
+                class="button primary"
+                id="pushHfDatasetButton"
+                type="submit"
+              >
+                Push To Hugging Face
+              </button>
+            </form>
+            <div
+              class="column-toggles hf-column-toggles"
+              id="hfColumnToggles"
+            ></div>
+            <p class="hint">
+              Token source: HF_TOKEN, HUGGINGFACE_TOKEN,
+              synthetic_cs_dataset/.env, or Hugging Face CLI login on the
+              server.
+            </p>
+            <div class="progress-card" id="hfPushProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="hfPushProgressLabel">Waiting</strong>
+                <span id="hfPushProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="Hugging Face push progress"
+              >
+                <div class="progress-fill" id="hfPushProgressFill"></div>
+              </div>
+              <p class="hint" id="hfPushProgressDetails">No push running.</p>
+            </div>
+          </section>
+        </section>
+
+        <section class="workspace-page" id="generatorPage" hidden>
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">Darija Code-Switch Generator</p>
+              <h2>
+                Generate mixed-script Darija, French, and English ASR data.
+              </h2>
+              <p>
+                Run a one-sample smoke test first, then launch a full text and
+                OmniVoice audio generation job with the parameters below.
+              </p>
+            </div>
+          </header>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Quick Test</h2>
+            </div>
+            <div class="form-grid">
+              <label class="wide-field">
+                <span>Reference audio path</span>
+                <input
+                  id="smokeReferenceAudioInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/ref_darija_french.wav"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Reference text</span>
+                <input
+                  id="smokeReferenceTextInput"
+                  type="text"
+                  value="السلام، سميتي أحمد، كنخدم dans le développement logiciel وكنهضر بالدارجة مع un peu de français."
+                  autocomplete="off"
+                />
+              </label>
+            </div>
+            <div class="action-row">
+              <button
+                class="button primary"
+                id="syntheticTestButton"
+                type="button"
+              >
+                Run 1-Sample Test
+              </button>
+              <p class="hint">
+                Put the reference WAV at the path above, or use an absolute
+                path. The test writes to
+                `synthetic_cs_dataset/data/smoke_test/`.
+              </p>
+            </div>
+            <div class="result-box" id="smokeResult" hidden></div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Generate Dataset</h2>
+            </div>
+            <form class="form-grid generator-form" id="generatorForm">
+              <label class="wide-field">
+                <span>Config path</span>
+                <input
+                  id="generatorConfigInput"
+                  type="text"
+                  value="synthetic_cs_dataset/configs/generation.yaml"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Number of texts</span>
+                <input
+                  id="generatorNumTextsInput"
+                  type="number"
+                  min="1"
+                  max="30000"
+                  step="1"
+                  value="10000"
+                />
+              </label>
+              <label>
+                <span>Batch size</span>
+                <input
+                  id="generatorBatchSizeInput"
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  value="40"
+                />
+              </label>
+              <label>
+                <span>Target hours</span>
+                <input
+                  id="generatorTargetHoursInput"
+                  type="number"
+                  min="0.01"
+                  max="100"
+                  step="0.25"
+                  value="12"
+                />
+              </label>
+              <label>
+                <span>Augmentation probability</span>
+                <input
+                  id="generatorAugProbInput"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value="0"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Output folder</span>
+                <input
+                  id="generatorOutputDirInput"
+                  type="text"
+                  value="data"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Reference speakers folder</span>
+                <input
+                  id="generatorReferenceDirInput"
+                  type="text"
+                  value="data/reference_speakers"
+                  autocomplete="off"
+                />
+              </label>
+              <button
+                class="button primary"
+                id="generateDatasetButton"
+                type="submit"
+              >
+                Generate Dataset
+              </button>
+            </form>
+
+            <div class="progress-card" id="generationProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="generationProgressLabel">Waiting</strong>
+                <span id="generationProgressPercent">0%</span>
+              </div>
+              <div class="progress-track" aria-label="Generation progress">
+                <div class="progress-fill" id="generationProgressFill"></div>
+              </div>
+              <p class="hint" id="generationProgressDetails">No job running.</p>
+            </div>
+          </section>
+        </section>
+
+        <section class="workspace-page" id="cleanerPage" hidden>
+          <header class="page-header">
+            <div>
+              <p class="eyebrow">Datasets Cleaner</p>
+              <h2>Remove bad samples from a saved speech dataset.</h2>
+              <p>
+                Remove bad audio/text pairs, filter durations, add augmentation,
+                normalize transcript style, then remove repeated transcript
+                rows.
+              </p>
+            </div>
+          </header>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Bad Sample Removal</h2>
+            </div>
+            <form class="form-grid cleaner-form" id="cleanerForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="cleanerDatasetPathInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/darija_clean"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Transcript column</span>
+                <input
+                  id="cleanerTranscriptColumnInput"
+                  type="text"
+                  placeholder="text"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Audio column</span>
+                <input
+                  id="cleanerAudioColumnInput"
+                  type="text"
+                  placeholder="audio"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Whisper model</span>
+                <input
+                  id="cleanerWhisperModelInput"
+                  type="text"
+                  value="afyfbadreddine77/whisper-large-v3-turbo-darija"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Language</span>
+                <input
+                  id="cleanerLanguageInput"
+                  type="text"
+                  placeholder="auto-detect"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>CER threshold</span>
+                <input
+                  id="cleanerCerThresholdInput"
+                  type="number"
+                  min="0"
+                  step="0.05"
+                  value="0.85"
+                />
+                <small>Only remove samples above this CER (higher = less aggressive)</small>
+              </label>
+              <label>
+                <span>Min chars/sec</span>
+                <input
+                  id="cleanerMinCpsInput"
+                  type="number"
+                  min="0.1"
+                  step="0.5"
+                  value="1.5"
+                />
+              </label>
+              <label>
+                <span>Max chars/sec</span>
+                <input
+                  id="cleanerMaxCpsInput"
+                  type="number"
+                  min="0.1"
+                  step="0.5"
+                  value="22"
+                />
+              </label>
+              <label class="checkbox-field">
+                <input id="cleanerUseWhisperInput" type="checkbox" checked />
+                <span>Whisper CER</span>
+              </label>
+              <label class="checkbox-field">
+                <input id="cleanerUseCpsInput" type="checkbox" checked />
+                <span>Chars/sec</span>
+              </label>
+              <label class="wide-field">
+                <span>Save mode</span>
+                <select id="cleanerSaveModeInput">
+                  <option value="copy" selected>Save cleaned copy</option>
+                  <option value="overwrite">Override original dataset</option>
+                </select>
+              </label>
+              <label class="wide-field" id="cleanerOutputPathField">
+                <span>New dataset path</span>
+                <input
+                  id="cleanerOutputPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_cleaned/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="checkbox-field" id="cleanerOverwriteOutputField">
+                <input id="cleanerOverwriteOutputInput" type="checkbox" />
+                <span>Overwrite output folder</span>
+              </label>
+              <button
+                class="button primary"
+                id="runCleanerButton"
+                type="submit"
+              >
+                Run Cleaner
+              </button>
+            </form>
+
+            <div class="progress-card" id="cleanerProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="cleanerProgressLabel">Waiting</strong>
+                <span id="cleanerProgressPercent">0%</span>
+              </div>
+              <div class="progress-track" aria-label="Dataset cleaner progress">
+                <div class="progress-fill" id="cleanerProgressFill"></div>
+              </div>
+              <p class="hint" id="cleanerProgressDetails">
+                No cleaner job running.
+              </p>
+            </div>
+
+            <div class="result-box" id="cleanerResult" hidden></div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Transcript Normalization</h2>
+            </div>
+            <form class="form-grid cleaner-form" id="textNormalizerForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="textNormalizerDatasetPathInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/darija_clean"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Transcript column</span>
+                <input
+                  id="textNormalizerTranscriptColumnInput"
+                  type="text"
+                  placeholder="text"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Output column</span>
+                <input
+                  id="textNormalizerOutputColumnInput"
+                  type="text"
+                  value="normalized_text"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Language column</span>
+                <input
+                  id="textNormalizerLanguageColumnInput"
+                  type="text"
+                  placeholder="lang"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Fallback language</span>
+                <input
+                  id="textNormalizerLanguageInput"
+                  type="text"
+                  placeholder="ary-fr-en"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Ta marbuta</span>
+                <select id="textNormalizerTaMarbutaInput">
+                  <option value="keep" selected>Keep ة</option>
+                  <option value="h">Final ة → ه</option>
+                </select>
+              </label>
+              <label class="checkbox-field">
+                <input id="textNormalizerStripAccentsInput" type="checkbox" />
+                <span>Strip French accents</span>
+              </label>
+              <label class="checkbox-field">
+                <input id="textNormalizerOverwriteTextInput" type="checkbox" />
+                <span>Overwrite transcript column</span>
+              </label>
+              <label class="wide-field">
+                <span>Save mode</span>
+                <select id="textNormalizerSaveModeInput">
+                  <option value="copy" selected>Save normalized copy</option>
+                  <option value="overwrite">Override original dataset</option>
+                </select>
+              </label>
+              <label class="wide-field" id="textNormalizerOutputPathField">
+                <span>New dataset path</span>
+                <input
+                  id="textNormalizerOutputPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_normalized/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label
+                class="checkbox-field"
+                id="textNormalizerOverwriteOutputField"
+              >
+                <input
+                  id="textNormalizerOverwriteOutputInput"
+                  type="checkbox"
+                />
+                <span>Overwrite output folder</span>
+              </label>
+              <button
+                class="button primary"
+                id="runTextNormalizerButton"
+                type="submit"
+              >
+                Normalize Text
+              </button>
+            </form>
+
+            <div class="progress-card" id="textNormalizerProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="textNormalizerProgressLabel">Waiting</strong>
+                <span id="textNormalizerProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="Transcript normalization progress"
+              >
+                <div
+                  class="progress-fill"
+                  id="textNormalizerProgressFill"
+                ></div>
+              </div>
+              <p class="hint" id="textNormalizerProgressDetails">
+                No normalization job running.
+              </p>
+            </div>
+
+            <div class="result-box" id="textNormalizerResult" hidden></div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Duration Filtering</h2>
+            </div>
+            <form class="form-grid cleaner-form" id="durationFilterForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="durationFilterDatasetPathInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/darija_clean"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Duration column</span>
+                <input
+                  id="durationFilterDurationColumnInput"
+                  type="text"
+                  placeholder="duration_seconds"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Audio column</span>
+                <input
+                  id="durationFilterAudioColumnInput"
+                  type="text"
+                  placeholder="audio"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Min seconds</span>
+                <input
+                  id="durationFilterMinSecondsInput"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  value="1"
+                />
+              </label>
+              <label>
+                <span>Max seconds</span>
+                <input
+                  id="durationFilterMaxSecondsInput"
+                  type="number"
+                  min="0.1"
+                  step="0.5"
+                  value="30"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Save mode</span>
+                <select id="durationFilterSaveModeInput">
+                  <option value="copy" selected>
+                    Save duration-filtered copy
+                  </option>
+                  <option value="overwrite">Override original dataset</option>
+                </select>
+              </label>
+              <label class="wide-field" id="durationFilterOutputPathField">
+                <span>New dataset path</span>
+                <input
+                  id="durationFilterOutputPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_duration_filtered/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label
+                class="checkbox-field"
+                id="durationFilterOverwriteOutputField"
+              >
+                <input
+                  id="durationFilterOverwriteOutputInput"
+                  type="checkbox"
+                />
+                <span>Overwrite output folder</span>
+              </label>
+              <button
+                class="button primary"
+                id="runDurationFilterButton"
+                type="submit"
+              >
+                Filter Duration
+              </button>
+            </form>
+
+            <div class="progress-card" id="durationFilterProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="durationFilterProgressLabel">Waiting</strong>
+                <span id="durationFilterProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="Duration filtering progress"
+              >
+                <div
+                  class="progress-fill"
+                  id="durationFilterProgressFill"
+                ></div>
+              </div>
+              <p class="hint" id="durationFilterProgressDetails">
+                No duration filter job running.
+              </p>
+            </div>
+
+            <div class="result-box" id="durationFilterResult" hidden></div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Generate Duration Column</h2>
+            </div>
+            <form class="form-grid cleaner-form" id="durationColumnForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="durationColumnDatasetPathInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/darija_clean"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Audio column</span>
+                <input
+                  id="durationColumnAudioColumnInput"
+                  type="text"
+                  placeholder="audio"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Column name</span>
+                <input
+                  id="durationColumnNameInput"
+                  type="text"
+                  value="duration"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Save mode</span>
+                <select id="durationColumnSaveModeInput">
+                  <option value="copy" selected>
+                    Save copy with duration column
+                  </option>
+                  <option value="overwrite">Override original dataset</option>
+                </select>
+              </label>
+              <label class="wide-field" id="durationColumnOutputPathField">
+                <span>New dataset path</span>
+                <input
+                  id="durationColumnOutputPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_with_duration/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label
+                class="checkbox-field"
+                id="durationColumnOverwriteOutputField"
+              >
+                <input
+                  id="durationColumnOverwriteOutputInput"
+                  type="checkbox"
+                />
+                <span>Overwrite output folder</span>
+              </label>
+              <button
+                class="button primary"
+                id="runDurationColumnButton"
+                type="submit"
+              >
+                Generate Duration Column
+              </button>
+            </form>
+
+            <div class="progress-card" id="durationColumnProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="durationColumnProgressLabel">Waiting</strong>
+                <span id="durationColumnProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="Duration column generation progress"
+              >
+                <div
+                  class="progress-fill"
+                  id="durationColumnProgressFill"
+                ></div>
+              </div>
+              <p class="hint" id="durationColumnProgressDetails">
+                No duration column job running.
+              </p>
+            </div>
+
+            <div class="result-box" id="durationColumnResult" hidden></div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Data Augmentation</h2>
+            </div>
+            <form class="form-grid cleaner-form" id="augmentationForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="augmentationDatasetPathInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/darija_clean"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Audio column</span>
+                <input
+                  id="augmentationAudioColumnInput"
+                  type="text"
+                  placeholder="audio"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Duration column</span>
+                <input
+                  id="augmentationDurationColumnInput"
+                  type="text"
+                  placeholder="duration_seconds"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Split</span>
+                <input
+                  id="augmentationSplitInput"
+                  type="text"
+                  value="train"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Target extra %</span>
+                <input
+                  id="augmentationTargetPercentInput"
+                  type="number"
+                  min="0.1"
+                  step="1"
+                  value="50"
+                />
+              </label>
+              <label>
+                <span>Source column</span>
+                <input
+                  id="augmentationSourceColumnInput"
+                  type="text"
+                  value="source"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Include source contains</span>
+                <input
+                  id="augmentationIncludeSourcesInput"
+                  type="text"
+                  value=""
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Exclude source contains</span>
+                <input
+                  id="augmentationExcludeSourcesInput"
+                  type="text"
+                  value="darija_codeswitch_asr"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Speed coverage %</span>
+                <input
+                  id="augmentationSpeedCoverageInput"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value="25"
+                />
+              </label>
+              <label>
+                <span>Noise coverage %</span>
+                <input
+                  id="augmentationNoiseCoverageInput"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value="25"
+                />
+              </label>
+              <label>
+                <span>Reverb coverage %</span>
+                <input
+                  id="augmentationReverbCoverageInput"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value="15"
+                />
+              </label>
+              <label>
+                <span>Telephony coverage %</span>
+                <input
+                  id="augmentationTelephonyCoverageInput"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value="30"
+                />
+              </label>
+              <label>
+                <span>Gain coverage %</span>
+                <input
+                  id="augmentationGainCoverageInput"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value="15"
+                />
+              </label>
+              <label>
+                <span>Max copies/original</span>
+                <input
+                  id="augmentationMaxCopiesInput"
+                  type="number"
+                  min="1"
+                  max="5"
+                  step="1"
+                  value="2"
+                />
+              </label>
+              <label>
+                <span>Random seed</span>
+                <input
+                  id="augmentationSeedInput"
+                  type="number"
+                  step="1"
+                  value="77"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Save mode</span>
+                <select id="augmentationSaveModeInput">
+                  <option value="copy" selected>Save augmented copy</option>
+                  <option value="overwrite">Override original dataset</option>
+                </select>
+              </label>
+              <label class="wide-field" id="augmentationOutputPathField">
+                <span>New dataset path</span>
+                <input
+                  id="augmentationOutputPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_augmented/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label
+                class="checkbox-field"
+                id="augmentationOverwriteOutputField"
+              >
+                <input id="augmentationOverwriteOutputInput" type="checkbox" />
+                <span>Overwrite output folder</span>
+              </label>
+              <button
+                class="button primary"
+                id="runAugmentationButton"
+                type="submit"
+              >
+                Create Augmented Data
+              </button>
+            </form>
+
+            <div class="progress-card" id="augmentationProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="augmentationProgressLabel">Waiting</strong>
+                <span id="augmentationProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="Data augmentation progress"
+              >
+                <div class="progress-fill" id="augmentationProgressFill"></div>
+              </div>
+              <p class="hint" id="augmentationProgressDetails">
+                No augmentation job running.
+              </p>
+            </div>
+
+            <div class="result-box" id="augmentationResult" hidden></div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Duplicate Text Removal</h2>
+            </div>
+            <form class="form-grid cleaner-form" id="duplicateCleanerForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="duplicateDatasetPathInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/darija_clean"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Transcript column</span>
+                <input
+                  id="duplicateTranscriptColumnInput"
+                  type="text"
+                  placeholder="text"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="checkbox-field">
+                <input
+                  id="duplicateNormalizeTextInput"
+                  type="checkbox"
+                  checked
+                />
+                <span>Normalize text before matching</span>
+              </label>
+              <label class="wide-field">
+                <span>Save mode</span>
+                <select id="duplicateSaveModeInput">
+                  <option value="copy" selected>Save deduplicated copy</option>
+                  <option value="overwrite">Override original dataset</option>
+                </select>
+              </label>
+              <label class="wide-field" id="duplicateOutputPathField">
+                <span>New dataset path</span>
+                <input
+                  id="duplicateOutputPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_deduped/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="checkbox-field" id="duplicateOverwriteOutputField">
+                <input id="duplicateOverwriteOutputInput" type="checkbox" />
+                <span>Overwrite output folder</span>
+              </label>
+              <button
+                class="button primary"
+                id="runDuplicateCleanerButton"
+                type="submit"
+              >
+                Remove Duplicates
+              </button>
+            </form>
+
+            <div class="progress-card" id="duplicateProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="duplicateProgressLabel">Waiting</strong>
+                <span id="duplicateProgressPercent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                aria-label="Duplicate text removal progress"
+              >
+                <div class="progress-fill" id="duplicateProgressFill"></div>
+              </div>
+              <p class="hint" id="duplicateProgressDetails">
+                No duplicate cleaner job running.
+              </p>
+            </div>
+
+            <div class="result-box" id="duplicateResult" hidden></div>
+          </section>
+
+          <section class="panel form-panel">
+            <div class="panel-heading">
+              <h2>Source Removal</h2>
+            </div>
+            <form class="form-grid cleaner-form" id="sourceRemovalForm">
+              <label class="wide-field">
+                <span>Dataset path</span>
+                <input
+                  id="sourceRemovalDatasetPathInput"
+                  type="text"
+                  value="/teamspace/studios/this_studio/darija_clean"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Source column</span>
+                <input
+                  id="sourceRemovalColumnInput"
+                  type="text"
+                  placeholder="source"
+                  autocomplete="off"
+                />
+              </label>
+              <label>
+                <span>Sources to remove (comma-separated)</span>
+                <input
+                  id="sourceRemovalSourcesInput"
+                  type="text"
+                  placeholder="e.g. source_a, source_b"
+                  autocomplete="off"
+                />
+              </label>
+              <label class="wide-field">
+                <span>Save mode</span>
+                <select id="sourceRemovalSaveModeInput">
+                  <option value="copy" selected>Save filtered copy</option>
+                  <option value="overwrite">Override original dataset</option>
+                </select>
+              </label>
+              <label class="wide-field" id="sourceRemovalOutputPathField">
+                <span>New dataset path</span>
+                <input
+                  id="sourceRemovalOutputPathInput"
+                  type="text"
+                  value="synthetic_cs_dataset/data_filtered/hf_dataset"
+                  autocomplete="off"
+                />
+              </label>
+              <label
+                class="checkbox-field"
+                id="sourceRemovalOverwriteOutputField"
+              >
+                <input id="sourceRemovalOverwriteOutputInput" type="checkbox" />
+                <span>Overwrite output folder</span>
+              </label>
+              <button
+                class="button primary"
+                id="runSourceRemovalButton"
+                type="submit"
+              >
+                Remove Sources
+              </button>
+            </form>
+
+            <div class="progress-card" id="sourceRemovalProgressCard" hidden>
+              <div class="progress-header">
+                <strong id="sourceRemovalProgressLabel">Waiting</strong>
+                <span id="sourceRemovalProgressPercent">0%</span>
+              </div>
+              <div class="progress-track" aria-label="Source removal progress">
+                <div class="progress-fill" id="sourceRemovalProgressFill"></div>
+              </div>
+              <p class="hint" id="sourceRemovalProgressDetails">
+                No source removal job running.
+              </p>
+            </div>
+
+            <div class="result-box" id="sourceRemovalResult" hidden></div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script src="./app.js?v=studio14"></script>
+  </body>
+</html>

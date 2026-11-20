@@ -1,0 +1,5055 @@
+#!/usr/bin/env python3
+"""Serve Moroccan ASR Dataset Studio and read local dataset paths.
+
+Run this on Lightning instead of `python3 -m http.server`:
+
+    python3 viewer_server.py /teamspace/studios/this_studio/darija_clean --host 0.0.0.0 --port 8000
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import io
+import json
+import mimetypes
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".oga", ".aac", ".flac", ".webm"}
+TRANSCRIPT_COLUMN_CANDIDATES = [
+    "text",
+    "sentence",
+    "transcript",
+    "transcription",
+    "expected_transcript",
+    "normalized_text",
+]
+AUDIO_COLUMN_CANDIDATES = [
+    "audio",
+    "audio_path",
+    "file_name",
+    "filepath",
+    "path",
+    "wav",
+    "clip",
+]
+DURATION_COLUMN_CANDIDATES = [
+    "duration_seconds",
+    "duration",
+    "duration_s",
+    "duration_ms",
+    "seconds",
+    "secs",
+    "length_seconds",
+    "audio_duration",
+    "audio_length",
+]
+DURATION_COLUMN_NAME = "duration"
+AUGMENTATION_META_DEFAULTS = {
+    "is_augmented": False,
+    "augmentation_id": "",
+    "augmentation_type": "",
+    "augmentation_variant": "",
+    "augmentation_parent_id": "",
+    "augmentation_parent_split": "",
+    "augmentation_parent_row": -1,
+    "augmentation_snr_db": 0.0,
+    "augmentation_speed_factor": 0.0,
+    "augmentation_gain_db": 0.0,
+}
+DEFAULT_DATASET_PATH = Path("/teamspace/studios/this_studio/darija_clean")
+GENERATION_JOBS: dict[str, dict] = {}
+GENERATION_LOCK = threading.Lock()
+HF_DATASET_JOBS: dict[str, dict] = {}
+HF_DATASET_LOCK = threading.Lock()
+CLEANER_JOBS: dict[str, dict] = {}
+CLEANER_LOCK = threading.Lock()
+WHISPER_MODELS: dict[str, object] = {}
+WHISPER_LOCK = threading.Lock()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Serve Moroccan ASR Dataset Studio with local APIs.")
+    parser.add_argument(
+        "dataset_path",
+        nargs="?",
+        type=Path,
+        default=Path(os.environ.get("DATASET_PATH", DEFAULT_DATASET_PATH)),
+        help="Path to a Hugging Face save_to_disk dataset or dataset_dict folder.",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind.")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind.")
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=int(os.environ.get("VIEWER_MAX_ROWS", "0")),
+        help="Rows per split to send. 0 means all rows.",
+    )
+    return parser.parse_args()
+
+
+class DatasetViewerHandler(SimpleHTTPRequestHandler):
+    dataset_path: Path
+    max_rows: int
+    site_root: Path
+    dataset_cache: dict[str, dict] = {}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(self.site_root), **kwargs)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/datasets":
+            payload = self.load_datasets(parsed.query)
+            if payload is not None:
+                self.send_json(payload)
+            return
+        if parsed.path == "/api/server-info":
+            self.send_json(
+                {
+                    "ok": True,
+                    "server": "viewer_server.py",
+                    "features": [
+                        "datasets",
+                        "audio",
+                        "synthetic-test",
+                        "generation-jobs",
+                        "hf-dataset-import",
+                        "hf-dataset-merge",
+                        "hf-dataset-push",
+                        "hf-dataset-split",
+                        "dataset-cleaner",
+                    ],
+                    "default_dataset_path": str(self.dataset_path),
+                    "default_max_rows": self.max_rows,
+                }
+            )
+            return
+        if parsed.path == "/api/cleaner/status":
+            self.send_dataset_cleaner_status(parsed.query)
+            return
+        if parsed.path == "/api/generation/status":
+            self.send_generation_status(parsed.query)
+            return
+        if parsed.path == "/api/hf/status":
+            self.send_hf_dataset_status(parsed.query)
+            return
+        if parsed.path == "/api/hf/columns":
+            self.send_hf_dataset_columns(parsed.query)
+            return
+        if parsed.path == "/api/audio":
+            self.send_audio(parsed.query)
+            return
+        if parsed.path == "/api/audio-row":
+            self.send_audio_row(parsed.query)
+            return
+        if parsed.path == "/api/synthetic-test":
+            self.run_synthetic_test()
+            return
+        if parsed.path == "/api/synthetic-test-audio":
+            self.send_synthetic_test_audio(parsed.query)
+            return
+        super().do_GET()
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/synthetic-test":
+            self.run_synthetic_test()
+            return
+        if parsed.path == "/api/generation/start":
+            self.start_generation()
+            return
+        if parsed.path == "/api/hf/merge/start":
+            self.start_hf_dataset_merge()
+            return
+        if parsed.path == "/api/hf/import/start":
+            self.start_hf_dataset_import()
+            return
+        if parsed.path == "/api/hf/push/start":
+            self.start_hf_dataset_push()
+            return
+        if parsed.path == "/api/hf/split/start":
+            self.start_hf_dataset_split()
+            return
+        if parsed.path == "/api/cleaner/bad-samples/start":
+            self.start_dataset_cleaner()
+            return
+        if parsed.path == "/api/cleaner/source-removal/start":
+            self.start_source_removal()
+            return
+        if parsed.path == "/api/cleaner/duplicates/start":
+            self.start_duplicate_cleaner()
+            return
+        if parsed.path == "/api/cleaner/duration/start":
+            self.start_duration_filter()
+            return
+        if parsed.path == "/api/cleaner/duration-column/start":
+            self.start_duration_column()
+            return
+        if parsed.path == "/api/cleaner/augmentation/start":
+            self.start_data_augmentation()
+            return
+        if parsed.path == "/api/cleaner/normalize-text/start":
+            self.start_text_normalizer()
+            return
+        self.send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+
+    def send_json(self, payload: object) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_error_json(self, status: HTTPStatus, message: str) -> None:
+        body = json.dumps({"ok": False, "error": message}, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def load_datasets(self, query: str = "") -> dict | None:
+        params = parse_qs(query)
+        path_value = params.get("path", [""])[0].strip()
+        max_rows_value = params.get("max_rows", [""])[0].strip()
+        path = Path(unquote(path_value)).expanduser() if path_value else self.dataset_path.expanduser()
+        path = path.resolve()
+        max_rows = self.max_rows
+        if max_rows_value:
+            try:
+                max_rows = max(0, int(max_rows_value))
+            except ValueError:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, "max_rows must be a number.")
+                return None
+
+        cache_key = f"{path}::{max_rows}"
+        if cache_key in self.__class__.dataset_cache:
+            self.__class__.dataset_path = path
+            self.__class__.max_rows = max_rows
+            return self.__class__.dataset_cache[cache_key]
+
+        try:
+            datasets = load_huggingface_dataset(path, max_rows)
+        except Exception as exc:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            return None
+
+        payload = {"path": str(path), "datasets": datasets}
+        self.__class__.dataset_path = path
+        self.__class__.max_rows = max_rows
+        self.__class__.dataset_cache[cache_key] = payload
+        return payload
+
+    def send_audio(self, query: str) -> None:
+        params = parse_qs(query)
+        raw_path = params.get("path", [""])[0]
+        if not raw_path:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing path")
+            return
+
+        dataset_root = self.dataset_path.expanduser().resolve()
+        audio_path = Path(unquote(raw_path)).expanduser()
+        if not audio_path.is_absolute():
+            audio_path = dataset_root / audio_path
+        audio_path = audio_path.resolve()
+
+        if not is_allowed_audio_path(audio_path, dataset_root):
+            self.send_error(HTTPStatus.FORBIDDEN, "Audio path is outside the dataset folder")
+            return
+        if not audio_path.exists() or not audio_path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND, "Audio file not found")
+            return
+
+        content_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(audio_path.stat().st_size))
+        self.end_headers()
+        with audio_path.open("rb") as handle:
+            self.copyfile(handle, self.wfile)
+
+    def run_synthetic_test(self) -> None:
+        pipeline_dir = self.site_root / "synthetic_cs_dataset"
+        script_path = pipeline_dir / "scripts" / "run_smoke_test.py"
+        if not script_path.exists():
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Synthetic pipeline script was not found.")
+            return
+
+        params = {}
+        if self.headers.get("Content-Length"):
+            try:
+                params = self.read_json_body()
+            except ValueError as exc:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+        command = [sys.executable, str(script_path)]
+        reference_audio = str(params.get("reference_audio") or "").strip()
+        reference_text = str(params.get("reference_text") or "").strip()
+        if reference_audio:
+            command.extend(["--reference-audio", reference_audio])
+        if reference_text:
+            command.extend(["--reference-text", reference_text])
+
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(pipeline_dir),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=int(os.environ.get("SYNTHETIC_TEST_TIMEOUT", "1200")),
+            )
+        except subprocess.TimeoutExpired:
+            self.send_error_json(HTTPStatus.GATEWAY_TIMEOUT, "Synthetic smoke test timed out.")
+            return
+
+        if result.returncode != 0:
+            message = parse_smoke_error(result.stdout) or result.stderr.strip() or "Synthetic smoke test failed."
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, message[-4000:])
+            return
+
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, result.stdout[-4000:] or "Invalid smoke test output.")
+            return
+
+        rows = payload.get("rows") if isinstance(payload, dict) else []
+        if not isinstance(rows, list) or not rows:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Smoke test did not create any rows.")
+            return
+
+        records = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            record = dict(row)
+            file_name = str(record.get("file_name") or record.get("audio") or "")
+            if file_name:
+                record["_play_audio"] = f"api/synthetic-test-audio?path={quote(file_name)}"
+            records.append(record)
+
+        response = {
+            "ok": True,
+            "data_dir": payload.get("data_dir"),
+            "text": payload.get("text"),
+            "audio_path": payload.get("audio_path"),
+            "dataset": {
+                "name": "Synthetic 1-sample smoke test",
+                "path": payload.get("dataset_path") or payload.get("data_dir") or "synthetic smoke test",
+                "records": records,
+            },
+        }
+        self.send_json(response)
+
+    def start_generation(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to start generation.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+        }
+        with GENERATION_LOCK:
+            GENERATION_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_generation_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def send_generation_status(self, query: str) -> None:
+        params = parse_qs(query)
+        job_id = params.get("id", [""])[0]
+        if not job_id:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Missing generation job id.")
+            return
+        with GENERATION_LOCK:
+            job = GENERATION_JOBS.get(job_id)
+            if job:
+                job = dict(job)
+        if not job:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Generation job not found.")
+            return
+        self.send_json({"ok": True, "job": public_job(job)})
+
+    def start_hf_dataset_merge(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to merge Hugging Face datasets.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with HF_DATASET_LOCK:
+            HF_DATASET_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_hf_dataset_merge_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_hf_dataset_import(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to import a Hugging Face dataset.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with HF_DATASET_LOCK:
+            HF_DATASET_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_hf_dataset_import_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_hf_dataset_push(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to push the dataset to Hugging Face.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with HF_DATASET_LOCK:
+            HF_DATASET_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_hf_dataset_push_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_hf_dataset_split(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to resplit the dataset.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with HF_DATASET_LOCK:
+            HF_DATASET_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_hf_dataset_split_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_dataset_cleaner(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to remove bad samples.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with CLEANER_LOCK:
+            CLEANER_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_dataset_cleaner_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_source_removal(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to remove sources.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with CLEANER_LOCK:
+            CLEANER_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_source_removal_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_duplicate_cleaner(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to remove duplicate transcripts.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with CLEANER_LOCK:
+            CLEANER_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_duplicate_cleaner_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_duration_filter(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to filter samples by duration.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with CLEANER_LOCK:
+            CLEANER_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_duration_filter_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_duration_column(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to generate duration column.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with CLEANER_LOCK:
+            CLEANER_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_duration_column_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_data_augmentation(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to create augmented audio copies.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with CLEANER_LOCK:
+            CLEANER_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_data_augmentation_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def start_text_normalizer(self) -> None:
+        try:
+            params = self.read_json_body()
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "ok": True,
+            "status": "queued",
+            "stage": "Queued",
+            "percent": 0,
+            "message": "Waiting to normalize transcript text.",
+            "error": "",
+            "log_tail": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "params": params,
+            "result": {},
+        }
+        with CLEANER_LOCK:
+            CLEANER_JOBS[job_id] = job
+
+        thread = threading.Thread(
+            target=run_text_normalizer_job,
+            args=(job_id, params, self.site_root),
+            daemon=True,
+        )
+        thread.start()
+        self.send_json({"ok": True, "job_id": job_id, "job": public_job(job)})
+
+    def send_dataset_cleaner_status(self, query: str) -> None:
+        params = parse_qs(query)
+        job_id = params.get("id", [""])[0]
+        if not job_id:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Missing dataset cleaner job id.")
+            return
+        with CLEANER_LOCK:
+            job = CLEANER_JOBS.get(job_id)
+            if job:
+                job = dict(job)
+        if not job:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Dataset cleaner job not found.")
+            return
+        self.send_json({"ok": True, "job": public_job(job)})
+
+    def send_hf_dataset_status(self, query: str) -> None:
+        params = parse_qs(query)
+        job_id = params.get("id", [""])[0]
+        if not job_id:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Missing Hugging Face dataset job id.")
+            return
+        with HF_DATASET_LOCK:
+            job = HF_DATASET_JOBS.get(job_id)
+            if job:
+                job = dict(job)
+        if not job:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Hugging Face dataset job not found.")
+            return
+        self.send_json({"ok": True, "job": public_job(job)})
+
+    def send_hf_dataset_columns(self, query: str) -> None:
+        params = parse_qs(query)
+        path_value = params.get("path", [""])[0].strip()
+        if not path_value:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Missing Hugging Face dataset path.")
+            return
+
+        pipeline_dir = self.site_root / "synthetic_cs_dataset"
+        try:
+            path = resolve_hf_dataset_path(unquote(path_value), self.site_root, pipeline_dir, must_exist=True)
+            if not path.exists():
+                raise RuntimeError(f"Hugging Face dataset path was not found: {path}")
+            split_map = load_hf_dataset_splits(path)
+            self.send_json({"ok": True, "path": str(path), **hf_columns_payload(split_map)})
+        except Exception as exc:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def read_json_body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Invalid request body length.") from exc
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Request body must be valid JSON.") from exc
+        if not isinstance(value, dict):
+            raise ValueError("Request body must be a JSON object.")
+        return value
+
+    def send_synthetic_test_audio(self, query: str) -> None:
+        params = parse_qs(query)
+        raw_path = params.get("path", [""])[0]
+        if not raw_path:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing path")
+            return
+
+        smoke_root = (self.site_root / "synthetic_cs_dataset" / "data" / "smoke_test").resolve()
+        audio_path = (smoke_root / unquote(raw_path)).resolve()
+        if not is_allowed_audio_path(audio_path, smoke_root):
+            self.send_error(HTTPStatus.FORBIDDEN, "Audio path is outside the smoke-test folder")
+            return
+        if not audio_path.exists() or not audio_path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND, "Audio file not found")
+            return
+        self.send_file_audio(audio_path)
+
+    def send_audio_row(self, query: str) -> None:
+        params = parse_qs(query)
+        split = params.get("split", [""])[0]
+        column = params.get("column", [""])[0]
+        row_text = params.get("row", [""])[0]
+        if not split or not column or not row_text.isdigit():
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing split, row, or column")
+            return
+
+        try:
+            audio_value = load_audio_cell(
+                self.dataset_path.expanduser().resolve(),
+                split,
+                int(row_text),
+                column,
+            )
+            self.send_audio_value(audio_value)
+        except FileNotFoundError as exc:
+            self.send_error(HTTPStatus.NOT_FOUND, str(exc))
+        except Exception as exc:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def send_audio_value(self, audio_value) -> None:
+        if not isinstance(audio_value, dict):
+            self.send_error(HTTPStatus.NOT_FOUND, "Audio cell is not a Hugging Face Audio value")
+            return
+
+        audio_bytes = audio_value.get("bytes")
+        audio_path_value = audio_value.get("path")
+
+        if audio_bytes:
+            path_hint = str(audio_path_value or "audio.wav")
+            content_type = mimetypes.guess_type(path_hint)[0] or "audio/wav"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(audio_bytes)))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            self.wfile.write(audio_bytes)
+            return
+
+        if audio_path_value:
+            audio_path = Path(str(audio_path_value)).expanduser()
+            dataset_root = self.dataset_path.expanduser().resolve()
+            if not audio_path.is_absolute():
+                audio_path = dataset_root / audio_path
+            audio_path = audio_path.resolve()
+            if not audio_path.exists() or not audio_path.is_file():
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            self.send_file_audio(audio_path)
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND, "Audio cell has no bytes or path")
+
+    def send_file_audio(self, audio_path: Path) -> None:
+        content_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(audio_path.stat().st_size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        with audio_path.open("rb") as handle:
+            self.copyfile(handle, self.wfile)
+
+
+def load_huggingface_dataset(path: Path, max_rows: int) -> list[dict]:
+    try:
+        from datasets import Audio, Dataset, DatasetDict, load_from_disk
+    except ImportError as exc:
+        raise RuntimeError("Install the `datasets` package on Lightning to read this folder.") from exc
+
+    loaded = load_from_disk(str(path))
+    output: list[dict] = []
+
+    if isinstance(loaded, DatasetDict):
+        for split_name, split_dataset in loaded.items():
+            output.append(dataset_payload(split_name, split_dataset, path, max_rows, Audio))
+        return output
+
+    if isinstance(loaded, Dataset):
+        output.append(dataset_payload(path.name, loaded, path, max_rows, Audio))
+        return output
+
+    raise RuntimeError(f"Unsupported dataset type at {path}")
+
+
+def public_job(job: dict) -> dict:
+    return {
+        "id": job.get("id"),
+        "status": job.get("status"),
+        "stage": job.get("stage"),
+        "percent": job.get("percent", 0),
+        "message": job.get("message", ""),
+        "error": job.get("error", ""),
+        "log_tail": job.get("log_tail", ""),
+        "started_at": job.get("started_at"),
+        "updated_at": job.get("updated_at"),
+        "params": job.get("params", {}),
+        "result": job.get("result", {}),
+    }
+
+
+def update_generation_job(job_id: str, **updates) -> None:
+    with GENERATION_LOCK:
+        job = GENERATION_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+
+
+def update_hf_dataset_job(job_id: str, **updates) -> None:
+    with HF_DATASET_LOCK:
+        job = HF_DATASET_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+
+
+def update_cleaner_job(job_id: str, **updates) -> None:
+    with CLEANER_LOCK:
+        job = CLEANER_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+
+
+def collect_dataset_path_values(value) -> list[str]:
+    if isinstance(value, str):
+        candidates = value.replace(",", "\n").splitlines()
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        candidates = []
+
+    paths = []
+    for candidate in candidates:
+        path = str(candidate or "").strip().strip("\"'")
+        if path:
+            paths.append(path)
+    return paths
+
+
+def collect_column_values(value) -> list[str]:
+    if isinstance(value, str):
+        candidates = value.replace(",", "\n").splitlines()
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        candidates = []
+
+    columns = []
+    seen = set()
+    for candidate in candidates:
+        column = str(candidate or "").strip().strip("\"'")
+        if column and column not in seen:
+            seen.add(column)
+            columns.append(column)
+    return columns
+
+
+def collect_filter_terms(value) -> list[str]:
+    if isinstance(value, str):
+        candidates = re.split(r"[\n,]+", value)
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        candidates = []
+
+    terms: list[str] = []
+    seen = set()
+    for candidate in candidates:
+        term = str(candidate or "").strip().strip("\"'").lower()
+        if term and term not in seen:
+            seen.add(term)
+            terms.append(term)
+    return terms
+
+
+def normalize_hf_dataset_repo_id(value: str) -> str:
+    text = str(value or "").strip().strip("\"'")
+    if text.startswith(("http://", "https://")):
+        parsed = urlparse(text)
+        if not parsed.netloc.endswith("huggingface.co"):
+            raise RuntimeError("Hugging Face dataset URL must be on huggingface.co.")
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
+        if parts and parts[0] == "datasets":
+            parts = parts[1:]
+        if len(parts) >= 2:
+            text = "/".join(parts[:2])
+        elif parts:
+            text = parts[0]
+        else:
+            text = ""
+
+    if text.startswith("datasets/"):
+        text = text[len("datasets/") :]
+    text = text.strip("/")
+    if not text:
+        raise RuntimeError("Enter a Hugging Face dataset repo id, for example `mozilla-foundation/common_voice_17_0`.")
+    if re.search(r"\s", text):
+        raise RuntimeError("Hugging Face dataset repo id cannot contain spaces.")
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?$", text):
+        raise RuntimeError("Enter a valid Hugging Face dataset repo id like `owner/name`.")
+    return text
+
+
+def safe_slug(*parts: str) -> str:
+    raw = "-".join(str(part or "").strip() for part in parts if str(part or "").strip())
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw.replace("/", "-")).strip("-._")
+    return slug[:120] or "dataset"
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.name}-{index}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not choose a unique output path near {path}")
+
+
+def default_hf_import_path(site_root: Path, repo_id: str, config_name: str, split: str, revision: str) -> Path:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    slug = safe_slug(repo_id, config_name, split, revision)
+    return (pipeline_dir / "data" / "hf_imports" / slug).resolve()
+
+
+def resolve_hf_dataset_path(path_value: str, site_root: Path, pipeline_dir: Path, must_exist: bool) -> Path:
+    raw = Path(str(path_value or "").strip()).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+
+    candidates = [site_root / raw, pipeline_dir / raw]
+    if must_exist:
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def load_hf_dataset_splits(path: Path) -> dict[str, object]:
+    try:
+        from datasets import Dataset, DatasetDict, load_from_disk
+    except ImportError as exc:
+        raise RuntimeError("Install the `datasets` package before merging Hugging Face datasets.") from exc
+
+    loaded = load_from_disk(str(path))
+    if isinstance(loaded, DatasetDict):
+        return dict(loaded.items())
+    if isinstance(loaded, Dataset):
+        return {"train": loaded}
+    raise RuntimeError(f"Unsupported Hugging Face dataset type at {path}")
+
+
+def hf_columns_payload(split_map: dict[str, object]) -> dict:
+    columns_by_split = {
+        split: list(getattr(dataset, "column_names", []) or [])
+        for split, dataset in split_map.items()
+    }
+    row_counts = {split: len(dataset) for split, dataset in split_map.items()}
+    if not columns_by_split:
+        return {"columns": [], "columns_by_split": {}, "rows_by_split": {}}
+
+    ordered_common = list(next(iter(columns_by_split.values())))
+    for columns in list(columns_by_split.values())[1:]:
+        allowed = set(columns)
+        ordered_common = [column for column in ordered_common if column in allowed]
+
+    return {
+        "columns": ordered_common,
+        "columns_by_split": columns_by_split,
+        "rows_by_split": row_counts,
+    }
+
+
+def filter_dataset_columns(loaded, selected_columns: list[str]):
+    if not selected_columns:
+        return loaded
+
+    try:
+        from datasets import Dataset, DatasetDict
+    except ImportError as exc:
+        raise RuntimeError("Install the `datasets` package before filtering columns.") from exc
+
+    if isinstance(loaded, Dataset):
+        missing = [column for column in selected_columns if column not in loaded.column_names]
+        if missing:
+            raise RuntimeError(f"Selected column(s) not found: {', '.join(missing)}")
+        remove_columns = [column for column in loaded.column_names if column not in selected_columns]
+        return loaded.remove_columns(remove_columns) if remove_columns else loaded
+
+    if isinstance(loaded, DatasetDict):
+        filtered = DatasetDict()
+        missing_by_split = {}
+        for split, dataset in loaded.items():
+            missing = [column for column in selected_columns if column not in dataset.column_names]
+            if missing:
+                missing_by_split[split] = missing
+                continue
+            remove_columns = [column for column in dataset.column_names if column not in selected_columns]
+            filtered[split] = dataset.remove_columns(remove_columns) if remove_columns else dataset
+        if missing_by_split:
+            details = "; ".join(f"{split}: {', '.join(columns)}" for split, columns in missing_by_split.items())
+            raise RuntimeError(f"Selected column(s) are missing from some splits: {details}")
+        return filtered
+
+    raise RuntimeError("Unsupported Hugging Face dataset type.")
+
+
+def loaded_columns_by_split(loaded) -> dict[str, list[str]]:
+    try:
+        from datasets import Dataset, DatasetDict
+    except ImportError as exc:
+        raise RuntimeError("Install the `datasets` package before reading columns.") from exc
+
+    if isinstance(loaded, Dataset):
+        return {"train": list(loaded.column_names)}
+    if isinstance(loaded, DatasetDict):
+        return {split: list(dataset.column_names) for split, dataset in loaded.items()}
+    return {}
+
+
+def read_simple_env_token(env_path: Path) -> str:
+    if not env_path.exists():
+        return ""
+    with env_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key.strip() in {"HF_TOKEN", "HUGGINGFACE_TOKEN"}:
+                return value.strip().strip("\"'")
+    return ""
+
+
+def get_hf_token(site_root: Path) -> str:
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+        or read_simple_env_token(site_root / "synthetic_cs_dataset" / ".env")
+        or read_simple_env_token(site_root / ".env")
+    )
+
+
+def guarded_remove_output(path: Path, site_root: Path, pipeline_dir: Path) -> None:
+    resolved = path.resolve()
+    protected = {
+        Path("/").resolve(),
+        Path.home().resolve(),
+        site_root.resolve(),
+        pipeline_dir.resolve(),
+    }
+    if resolved in protected or len(resolved.parts) < 3:
+        raise RuntimeError(f"Refusing to overwrite protected path: {resolved}")
+    if resolved.is_dir():
+        shutil.rmtree(resolved)
+    elif resolved.exists():
+        resolved.unlink()
+
+
+def dataset_shape_payload(loaded, single_split_name: str = "train") -> dict:
+    try:
+        from datasets import Dataset, DatasetDict
+    except ImportError as exc:
+        raise RuntimeError("Install the `datasets` package before reading Hugging Face dataset details.") from exc
+
+    if isinstance(loaded, Dataset):
+        split_name = single_split_name or "train"
+        return {
+            "rows_by_split": {split_name: len(loaded)},
+            "columns_by_split": {split_name: list(loaded.column_names)},
+        }
+    if isinstance(loaded, DatasetDict):
+        return {
+            "rows_by_split": {split: len(dataset) for split, dataset in loaded.items()},
+            "columns_by_split": {split: list(dataset.column_names) for split, dataset in loaded.items()},
+        }
+    raise RuntimeError("Unsupported Hugging Face dataset type.")
+
+
+def load_dataset_from_hub(
+    repo_id: str,
+    config_name: str,
+    split: str,
+    revision: str,
+    token: str,
+    trust_remote_code: bool,
+):
+    try:
+        from datasets import Dataset, DatasetDict, load_dataset
+    except ImportError as exc:
+        raise RuntimeError("Install the `datasets` package before importing datasets from Hugging Face.") from exc
+
+    kwargs = {}
+    if config_name:
+        kwargs["name"] = config_name
+    if split:
+        kwargs["split"] = split
+    if revision:
+        kwargs["revision"] = revision
+    if token:
+        kwargs["token"] = token
+    if trust_remote_code:
+        kwargs["trust_remote_code"] = True
+
+    try:
+        loaded = load_dataset(repo_id, **kwargs)
+    except TypeError as exc:
+        fallback_kwargs = dict(kwargs)
+        changed = False
+        text = str(exc)
+        if "token" in text and "token" in fallback_kwargs:
+            fallback_kwargs.pop("token", None)
+            fallback_kwargs["use_auth_token"] = token
+            changed = True
+        if "trust_remote_code" in text and "trust_remote_code" in fallback_kwargs:
+            fallback_kwargs.pop("trust_remote_code", None)
+            changed = True
+        if not changed:
+            raise
+        loaded = load_dataset(repo_id, **fallback_kwargs)
+
+    if not isinstance(loaded, (Dataset, DatasetDict)):
+        raise RuntimeError(f"Unsupported dataset type returned by Hugging Face for {repo_id}")
+    return loaded
+
+
+def run_hf_dataset_import_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    output_path = None
+    try:
+        repo_id = normalize_hf_dataset_repo_id(str(params.get("repo_id") or ""))
+        config_name = str(params.get("config_name") or "").strip().strip("\"'")
+        split = str(params.get("split") or "").strip().strip("\"'")
+        revision = str(params.get("revision") or "").strip().strip("\"'")
+        output_value = str(params.get("output_path") or "").strip().strip("\"'")
+        overwrite = bool(params.get("overwrite"))
+        trust_remote_code = bool(params.get("trust_remote_code"))
+
+        if output_value:
+            output_path = resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+            if output_path.exists() and not overwrite:
+                raise RuntimeError(f"Output path already exists: {output_path}. Enable overwrite or choose another folder.")
+        else:
+            output_path = unique_path(default_hf_import_path(site_root, repo_id, config_name, split, revision))
+
+        update_hf_dataset_job(
+            job_id,
+            status="running",
+            stage="Preparing",
+            percent=4,
+            message=f"Preparing to import {repo_id}.",
+            result={"repo_id": repo_id, "output_path": str(output_path)},
+        )
+
+        if output_path.exists() and overwrite:
+            update_hf_dataset_job(
+                job_id,
+                stage="Preparing",
+                percent=7,
+                message=f"Removing existing local folder: {output_path}",
+            )
+            guarded_remove_output(output_path, site_root, pipeline_dir)
+
+        token = get_hf_token(site_root)
+        load_label = repo_id
+        if config_name:
+            load_label += f" / {config_name}"
+        if split:
+            load_label += f" / {split}"
+
+        update_hf_dataset_job(
+            job_id,
+            stage="Downloading",
+            percent=12,
+            message=f"Loading {load_label} from Hugging Face. Large datasets can take a while.",
+        )
+        loaded = load_dataset_from_hub(repo_id, config_name, split, revision, token, trust_remote_code)
+        shape = dataset_shape_payload(loaded, split or "train")
+
+        update_hf_dataset_job(
+            job_id,
+            stage="Saving",
+            percent=78,
+            message=f"Saving imported dataset to {output_path}",
+            result={
+                "repo_id": repo_id,
+                "config_name": config_name,
+                "split": split,
+                "revision": revision,
+                "output_path": str(output_path),
+                **shape,
+            },
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        loaded.save_to_disk(str(output_path))
+        DatasetViewerHandler.dataset_cache.clear()
+
+        total_rows = sum(shape["rows_by_split"].values())
+        update_hf_dataset_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Imported {total_rows} row(s) from {repo_id} into {output_path}",
+            result={
+                "repo_id": repo_id,
+                "config_name": config_name,
+                "split": split,
+                "revision": revision,
+                "output_path": str(output_path),
+                **shape,
+            },
+        )
+    except Exception as exc:
+        hint = ""
+        text = str(exc)
+        if "401" in text or "Unauthorized" in text or "token" in text.lower():
+            hint = (
+                "\nFor private or gated datasets, set HF_TOKEN or HUGGINGFACE_TOKEN in the environment running "
+                "viewer_server.py, add HF_TOKEN to synthetic_cs_dataset/.env, or run `huggingface-cli login` there."
+            )
+        update_hf_dataset_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Hugging Face dataset import failed.",
+            error=f"{text}{hint}",
+            log_tail=f"{text}{hint}",
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def run_hf_dataset_merge_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    try:
+        path_values = collect_dataset_path_values(params.get("dataset_paths"))
+        if len(path_values) < 2:
+            raise RuntimeError("Enter at least two Hugging Face dataset paths to merge.")
+
+        output_value = str(params.get("output_path") or "").strip()
+        if not output_value:
+            raise RuntimeError("Choose an output folder for the merged Hugging Face dataset.")
+        output_path = resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+        overwrite = bool(params.get("overwrite"))
+
+        update_hf_dataset_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=5,
+            message=f"Loading {len(path_values)} Hugging Face dataset folder(s).",
+        )
+
+        loaded_sources: list[tuple[Path, dict[str, object]]] = []
+        source_rows: dict[str, dict[str, int]] = {}
+        for index, path_value in enumerate(path_values):
+            path = resolve_hf_dataset_path(path_value, site_root, pipeline_dir, must_exist=True)
+            if not path.exists():
+                raise RuntimeError(f"Hugging Face dataset path was not found: {path}")
+            split_map = load_hf_dataset_splits(path)
+            loaded_sources.append((path, split_map))
+            source_rows[str(path)] = {split: len(dataset) for split, dataset in split_map.items()}
+            percent = 5 + round(((index + 1) / len(path_values)) * 35, 1)
+            update_hf_dataset_job(
+                job_id,
+                percent=percent,
+                message=f"Loaded {path.name}: {', '.join(f'{split}={len(dataset)}' for split, dataset in split_map.items())}",
+                result={"source_rows": source_rows},
+            )
+
+        try:
+            from datasets import DatasetDict, concatenate_datasets
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before merging Hugging Face datasets.") from exc
+
+        columns_to_keep = collect_column_values(params.get("columns_to_keep"))
+
+        # Compute common columns across all datasets (intersection)
+        all_column_sets: list[set[str]] = []
+        for _, split_map in loaded_sources:
+            for _, dataset in split_map.items():
+                cols = set(getattr(dataset, "column_names", []) or [])
+                if cols:
+                    all_column_sets.append(cols)
+
+        common_columns: list[str] = []
+        if all_column_sets:
+            common_columns = sorted(set.intersection(*all_column_sets))
+
+        if columns_to_keep and common_columns:
+            missing_from_common = [c for c in columns_to_keep if c not in common_columns]
+            if missing_from_common:
+                raise RuntimeError(
+                    f"Requested column(s) are not common across all datasets: {', '.join(missing_from_common)}. "
+                    f"Common columns: {', '.join(common_columns)}"
+                )
+            target_columns = columns_to_keep
+        elif columns_to_keep and not common_columns:
+            raise RuntimeError("No common columns found across datasets.")
+        elif common_columns:
+            target_columns = common_columns
+        else:
+            raise RuntimeError("No common columns found across datasets. Specify column names explicitly.")
+
+        update_hf_dataset_job(
+            job_id,
+            percent=44,
+            message=f"Using columns: {', '.join(target_columns)}",
+        )
+
+        try:
+            from datasets import Audio, Features
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before merging Hugging Face datasets.") from exc
+
+        split_names = sorted({split for _, split_map in loaded_sources for split in split_map})
+        merged = DatasetDict()
+        merged_rows: dict[str, int] = {}
+        merged_columns: dict[str, list[str]] = {}
+
+        for index, split_name in enumerate(split_names):
+            update_hf_dataset_job(
+                job_id,
+                stage="Merging",
+                percent=45 + round((index / max(len(split_names), 1)) * 30, 1),
+                message=f"Merging split: {split_name}",
+            )
+            split_datasets = [split_map[split_name] for _, split_map in loaded_sources if split_name in split_map]
+
+            # Filter to target columns and unify features
+            aligned_datasets = []
+            for ds in split_datasets:
+                # Keep only columns that exist in this dataset
+                existing = [c for c in target_columns if c in ds.column_names]
+                if not existing:
+                    continue
+                ds_subset = ds.select_columns(existing) if len(existing) < len(ds.column_names) else ds
+                aligned_datasets.append(ds_subset)
+
+            if not aligned_datasets:
+                raise RuntimeError(
+                    f"Split `{split_name}` has no datasets with common target columns."
+                )
+            if len(aligned_datasets) < 2:
+                merged_split = aligned_datasets[0]
+            else:
+                # concatenate_datasets only accepts Audio(decode=True) columns, so
+                # cast audio to decode=True just for the merge (schema-only; no
+                # audio is decoded eagerly). The original audio features are
+                # restored after concatenation so the saved format matches the
+                # source folders.
+                original_audio_features = {
+                    col_name: feat
+                    for col_name, feat in aligned_datasets[0].features.items()
+                    if feat.__class__.__name__ == "Audio"
+                }
+                unified_features = {}
+                for col_name in target_columns:
+                    for ds in aligned_datasets:
+                        if col_name in ds.features:
+                            feat = ds.features[col_name]
+                            feat_class = feat.__class__.__name__
+                            if feat_class == "Audio":
+                                unified_features[col_name] = Audio(decode=True)
+                            else:
+                                unified_features[col_name] = feat
+                            break
+
+                cast_datasets = []
+                for ds in aligned_datasets:
+                    ds_features = dict(ds.features)
+                    # Only cast columns that need changing
+                    needs_cast = False
+                    for col_name, unified_feat in unified_features.items():
+                        if col_name in ds_features:
+                            current = ds_features[col_name]
+                            current_cls = current.__class__.__name__
+                            unified_cls = unified_feat.__class__.__name__
+                            if current_cls != unified_cls or (
+                                current_cls == "Audio"
+                                and getattr(current, "decode", True)
+                                is not getattr(unified_feat, "decode", True)
+                            ):
+                                needs_cast = True
+                                break
+                    if needs_cast:
+                        cast_datasets.append(ds.cast(Features(unified_features)))
+                    else:
+                        cast_datasets.append(ds)
+
+                try:
+                    merged_split = concatenate_datasets(cast_datasets)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not merge split `{split_name}`. Make sure common columns have matching types. {exc}"
+                    ) from exc
+
+                # Restore the original audio features (e.g. decode=False) so the
+                # merged dataset keeps the same storage format as its sources.
+                for col_name, audio_feat in original_audio_features.items():
+                    merged_split = merged_split.cast_column(col_name, audio_feat)
+
+            merged[split_name] = merged_split
+            merged_rows[split_name] = len(merged_split)
+            merged_columns[split_name] = list(merged_split.column_names)
+
+        if len(merged) == 0:
+            raise RuntimeError("No splits were found in the provided Hugging Face datasets.")
+
+        update_hf_dataset_job(
+            job_id,
+            stage="Saving",
+            percent=82,
+            message=f"Saving merged dataset to {output_path}",
+            result={
+                "output_path": str(output_path),
+                "source_rows": source_rows,
+                "rows_by_split": merged_rows,
+                "columns_by_split": merged_columns,
+            },
+        )
+        if output_path.exists():
+            if not overwrite:
+                raise RuntimeError(f"Output path already exists: {output_path}. Enable overwrite or choose a new folder.")
+            guarded_remove_output(output_path, site_root, pipeline_dir)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.save_to_disk(str(output_path))
+        DatasetViewerHandler.dataset_cache.clear()
+
+        total_rows = sum(merged_rows.values())
+        update_hf_dataset_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Merged {total_rows} row(s) into {output_path}",
+            result={
+                "output_path": str(output_path),
+                "source_rows": source_rows,
+                "rows_by_split": merged_rows,
+                "columns_by_split": merged_columns,
+            },
+        )
+    except Exception as exc:
+        update_hf_dataset_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Hugging Face dataset merge failed.",
+            error=str(exc),
+            log_tail=str(exc),
+        )
+
+
+def run_hf_dataset_push_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    try:
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        repo_id = str(params.get("repo_id") or "").strip()
+        selected_columns = collect_column_values(params.get("columns"))
+        private = bool(params.get("private"))
+        if not dataset_value:
+            raise RuntimeError("Missing Hugging Face dataset path.")
+        if not repo_id:
+            raise RuntimeError("Enter a Hugging Face dataset repo id, for example `username/darija-asr`.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Hugging Face dataset path was not found: {dataset_path}")
+
+        update_hf_dataset_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=10,
+            message=f"Loading merged dataset from {dataset_path}",
+        )
+        try:
+            from datasets import Dataset, DatasetDict, load_from_disk
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before pushing to Hugging Face.") from exc
+
+        loaded = load_from_disk(str(dataset_path))
+        if not isinstance(loaded, (Dataset, DatasetDict)):
+            raise RuntimeError(f"Unsupported Hugging Face dataset type at {dataset_path}")
+
+        if selected_columns:
+            update_hf_dataset_job(
+                job_id,
+                stage="Filtering columns",
+                percent=22,
+                message=f"Keeping {len(selected_columns)} selected column(s): {', '.join(selected_columns)}",
+            )
+            loaded = filter_dataset_columns(loaded, selected_columns)
+
+        row_count = len(loaded) if isinstance(loaded, Dataset) else sum(len(dataset) for dataset in loaded.values())
+        token = get_hf_token(site_root)
+        kwargs = {"repo_id": repo_id, "private": private}
+        if token:
+            kwargs["token"] = token
+
+        update_hf_dataset_job(
+            job_id,
+            stage="Pushing",
+            percent=35,
+            message=f"Pushing {row_count} row(s) to {repo_id}.",
+            result={
+                "dataset_path": str(dataset_path),
+                "repo_id": repo_id,
+                "columns_by_split": loaded_columns_by_split(loaded),
+                "selected_columns": selected_columns,
+            },
+        )
+        loaded.push_to_hub(**kwargs)
+        repo_url = f"https://huggingface.co/datasets/{repo_id}"
+        update_hf_dataset_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Pushed dataset to {repo_url}",
+            result={
+                "dataset_path": str(dataset_path),
+                "repo_id": repo_id,
+                "repo_url": repo_url,
+                "rows": row_count,
+                "columns_by_split": loaded_columns_by_split(loaded),
+                "selected_columns": selected_columns,
+            },
+        )
+    except Exception as exc:
+        hint = ""
+        text = str(exc)
+        if "401" in text or "Unauthorized" in text or "token" in text.lower():
+            hint = (
+                "\nSet HF_TOKEN or HUGGINGFACE_TOKEN in the environment running viewer_server.py, "
+                "add HF_TOKEN to synthetic_cs_dataset/.env, or run `huggingface-cli login` there."
+            )
+        update_hf_dataset_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Hugging Face push failed.",
+            error=f"{text}{hint}",
+            log_tail=f"{text}{hint}",
+        )
+
+
+def run_hf_dataset_split_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    output_path = None
+    try:
+        from datasets import DatasetDict, concatenate_datasets, Audio, Features
+
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        output_value = str(params.get("output_path") or "").strip()
+        include_splits = collect_column_values(params.get("include_splits"))
+        train_percent = parse_cleaner_float(params, "train_percent", 90.0)
+        test_percent = parse_cleaner_float(params, "test_percent", 10.0)
+        duration_column = str(params.get("duration_column") or "").strip()
+        seed = parse_cleaner_int(params, "seed", 42)
+        update_split_column = bool(params.get("update_split_column"))
+        overwrite = bool(params.get("overwrite"))
+
+        if not dataset_value:
+            raise RuntimeError("Missing Hugging Face dataset path to resplit.")
+        if not output_value:
+            raise RuntimeError("Choose an output folder for the resplit dataset.")
+        if train_percent <= 0 or test_percent <= 0:
+            raise RuntimeError("Train and test percentages must be greater than zero.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Hugging Face dataset path was not found: {dataset_path}")
+        output_path = resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+
+        update_hf_dataset_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=8,
+            message=f"Loading dataset from {dataset_path}",
+            result={"output_path": str(output_path)},
+        )
+
+        split_map = load_hf_dataset_splits(dataset_path)
+        if not split_map:
+            raise RuntimeError("The dataset has no splits to resplit.")
+
+        if include_splits:
+            missing = [name for name in include_splits if name not in split_map]
+            if missing:
+                raise RuntimeError(f"Input split(s) not found: {', '.join(missing)}")
+            chosen = {name: split_map[name] for name in include_splits}
+        else:
+            chosen = split_map
+
+        # Unify features (Audio decode=False) then concatenate the chosen splits into one pool.
+        datasets = list(chosen.values())
+        if not datasets:
+            raise RuntimeError("No input splits to resplit.")
+
+        columns = list(getattr(datasets[0], "column_names", []) or [])
+        if not columns:
+            raise RuntimeError("The dataset has no columns.")
+
+        if duration_column:
+            matched = match_column(columns, duration_column)
+            if not matched:
+                raise RuntimeError(f"Duration column was not found: {duration_column}")
+            duration_column = matched
+        else:
+            duration_column = ""
+            for candidate in DURATION_COLUMN_CANDIDATES:
+                matched = match_column(columns, candidate)
+                if matched:
+                    duration_column = matched
+                    break
+            if not duration_column:
+                raise RuntimeError(
+                    "Could not infer the duration column used to compute the split. "
+                    "Enter the duration column name explicitly."
+                )
+
+        update_hf_dataset_job(
+            job_id,
+            stage="Merging input splits",
+            percent=20,
+            message=f"Combining {len(datasets)} split(s) into one pool (duration column: {duration_column}).",
+        )
+
+        aligned = []
+        for ds in datasets:
+            if duration_column not in (list(getattr(ds, "column_names", []) or [])):
+                raise RuntimeError(
+                    f"Duration column `{duration_column}` is missing from one of the input splits."
+                )
+            if column_feature_is_audio(ds, duration_column):
+                raise RuntimeError(
+                    f"Column `{duration_column}` looks like audio, not a duration. "
+                    "Enter the duration column name explicitly."
+                )
+            aligned.append(ds)
+
+        original_audio_features = {
+            col_name: feat
+            for col_name, feat in aligned[0].features.items()
+            if feat.__class__.__name__ == "Audio"
+        }
+
+        if len(aligned) == 1:
+            pool = aligned[0]
+        else:
+            # concatenate_datasets only accepts Audio(decode=True) columns, so cast
+            # audio to decode=True just for the merge (schema-only; no audio is
+            # decoded eagerly). The original audio features are restored below.
+            unified_features = {}
+            for col_name in columns:
+                feat = aligned[0].features[col_name]
+                if feat.__class__.__name__ == "Audio":
+                    unified_features[col_name] = Audio(decode=True)
+                else:
+                    unified_features[col_name] = feat
+            casted = []
+            for ds in aligned:
+                needs_cast = False
+                for col_name, unified_feat in unified_features.items():
+                    if col_name in ds.features:
+                        current = ds.features[col_name]
+                        current_cls = current.__class__.__name__
+                        unified_cls = unified_feat.__class__.__name__
+                        if current_cls != unified_cls or (
+                            current_cls == "Audio"
+                            and getattr(current, "decode", True)
+                            is not getattr(unified_feat, "decode", True)
+                        ):
+                            needs_cast = True
+                            break
+                casted.append(ds.cast(Features(unified_features)) if needs_cast else ds)
+            try:
+                pool = concatenate_datasets(casted)
+            except Exception as exc:
+                raise RuntimeError(f"Could not combine the input splits. {exc}") from exc
+
+        raw_durations = pool[duration_column]
+        durations = [parse_duration_seconds(value, duration_column) for value in raw_durations]
+        if len(durations) != len(pool):
+            raise RuntimeError("Duration column length did not match the dataset rows.")
+
+        total_seconds = sum(durations)
+        if total_seconds <= 0:
+            raise RuntimeError(
+                f"Duration column `{duration_column}` has no usable values. "
+                "Enter a duration column with the seconds (or ms/minutes) per row."
+            )
+
+        # The two percentages define the train/test ratio; apply it to the actual total.
+        train_target_seconds = total_seconds * (train_percent / (train_percent + test_percent))
+
+        update_hf_dataset_job(
+            job_id,
+            stage="Splitting",
+            percent=45,
+            message=(
+                f"Shuffling {len(pool)} row(s) and splitting {train_percent:.1f}% : "
+                f"{test_percent:.1f}% (of {total_seconds / 3600:.2f}h total)."
+            ),
+        )
+
+        indices = list(range(len(pool)))
+        random.Random(seed).shuffle(indices)
+
+        train_indices: list[int] = []
+        test_indices: list[int] = []
+        train_seconds = 0.0
+        for index in indices:
+            if train_seconds < train_target_seconds:
+                train_indices.append(index)
+                train_seconds += durations[index]
+            else:
+                test_indices.append(index)
+
+        if not test_indices and train_indices:
+            # Guarantee at least one test row even when the train target is very close to total.
+            moved = train_indices.pop()
+            test_indices.append(moved)
+        if not train_indices:
+            raise RuntimeError("Train split ended up empty after splitting.")
+
+        train_hours_actual = sum(durations[i] for i in train_indices) / 3600.0
+        test_hours_actual = sum(durations[i] for i in test_indices) / 3600.0
+
+        def with_split_column(ds, split_name: str):
+            if update_split_column:
+                if "split" in ds.column_names:
+                    ds = ds.remove_columns(["split"])
+                ds = ds.add_column("split", [split_name] * len(ds))
+            return ds
+
+        train_ds = with_split_column(pool.select(train_indices), "train")
+        test_ds = with_split_column(pool.select(test_indices), "test")
+
+        # Restore the original audio features (e.g. decode=False) so the saved
+        # dataset keeps the same storage format as the source folder.
+        for col_name, audio_feat in original_audio_features.items():
+            train_ds = train_ds.cast_column(col_name, audio_feat)
+            test_ds = test_ds.cast_column(col_name, audio_feat)
+
+        resplit = DatasetDict({"train": train_ds, "test": test_ds})
+
+        rows_by_split = {"train": len(train_indices), "test": len(test_indices)}
+        hours_by_split = {
+            "train": round(train_hours_actual, 3),
+            "test": round(test_hours_actual, 3),
+        }
+
+        update_hf_dataset_job(
+            job_id,
+            stage="Saving",
+            percent=82,
+            message=f"Saving resplit dataset to {output_path}",
+            result={
+                "output_path": str(output_path),
+                "rows_by_split": rows_by_split,
+                "hours_by_split": hours_by_split,
+                "duration_column": duration_column,
+                "seed": seed,
+            },
+        )
+        if output_path.exists():
+            if not overwrite:
+                raise RuntimeError(
+                    f"Output path already exists: {output_path}. Enable overwrite or choose a new folder."
+                )
+            guarded_remove_output(output_path, site_root, pipeline_dir)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        resplit.save_to_disk(str(output_path))
+        DatasetViewerHandler.dataset_cache.clear()
+
+        update_hf_dataset_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=(
+                f"Resplit {len(pool)} row(s) into train ({train_hours_actual:.2f}h) "
+                f"and test ({test_hours_actual:.2f}h)."
+            ),
+            result={
+                "output_path": str(output_path),
+                "rows_by_split": rows_by_split,
+                "hours_by_split": hours_by_split,
+                "duration_column": duration_column,
+                "seed": seed,
+            },
+        )
+    except Exception as exc:
+        update_hf_dataset_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Hugging Face dataset resplit failed.",
+            error=str(exc),
+            log_tail=str(exc),
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def parse_cleaner_float(params: dict, key: str, default: float) -> float:
+    value = params.get(key)
+    if value in (None, ""):
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{key} must be a number.") from exc
+
+
+def parse_cleaner_int(params: dict, key: str, default: int) -> int:
+    value = params.get(key)
+    if value in (None, ""):
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{key} must be a whole number.") from exc
+
+
+def cleaner_bool(params: dict, key: str, default: bool) -> bool:
+    if key not in params:
+        return default
+    return bool(params.get(key))
+
+
+def match_column(columns: list[str], value: str) -> str:
+    requested = str(value or "").strip()
+    if not requested:
+        return ""
+    if requested in columns:
+        return requested
+    requested_lower = requested.lower()
+    for column in columns:
+        if column.lower() == requested_lower:
+            return column
+    return ""
+
+
+def column_feature_is_audio(dataset, column: str) -> bool:
+    feature = getattr(dataset, "features", {}).get(column)
+    return bool(feature and feature.__class__.__name__ == "Audio")
+
+
+def infer_common_cleaner_column(
+    split_map: dict[str, object],
+    requested: str,
+    candidates: list[str],
+    label: str,
+    audio: bool = False,
+) -> str:
+    if not split_map:
+        raise RuntimeError("The dataset has no splits.")
+
+    first_dataset = next(iter(split_map.values()))
+    first_columns = list(getattr(first_dataset, "column_names", []) or [])
+    if not first_columns:
+        raise RuntimeError("The dataset has no columns.")
+
+    if requested:
+        column = match_column(first_columns, requested)
+        if not column:
+            raise RuntimeError(f"{label} column was not found: {requested}")
+    else:
+        column = ""
+        if audio:
+            for candidate in first_columns:
+                if column_feature_is_audio(first_dataset, candidate):
+                    column = candidate
+                    break
+        if not column:
+            for candidate in candidates:
+                column = match_column(first_columns, candidate)
+                if column:
+                    break
+        if not column and audio:
+            for candidate in first_columns:
+                lower = candidate.lower()
+                if any(token in lower for token in ("audio", "sound", "recording", "voice", "clip", "file")):
+                    column = candidate
+                    break
+        if not column:
+            raise RuntimeError(
+                f"Could not infer the {label} column. Enter the column name explicitly."
+            )
+
+    missing = [
+        split
+        for split, dataset in split_map.items()
+        if column not in list(getattr(dataset, "column_names", []) or [])
+    ]
+    if missing:
+        raise RuntimeError(f"{label} column `{column}` is missing from split(s): {', '.join(missing)}")
+    return column
+
+
+def infer_optional_common_cleaner_column(
+    split_map: dict[str, object],
+    requested: str,
+    candidates: list[str],
+    label: str,
+) -> str:
+    if requested:
+        return infer_common_cleaner_column(split_map, requested, candidates, label)
+    if not split_map:
+        return ""
+
+    first_dataset = next(iter(split_map.values()))
+    first_columns = list(getattr(first_dataset, "column_names", []) or [])
+    for candidate in candidates:
+        column = match_column(first_columns, candidate)
+        if column:
+            missing = [
+                split
+                for split, dataset in split_map.items()
+                if column not in list(getattr(dataset, "column_names", []) or [])
+            ]
+            if not missing:
+                return column
+    return ""
+
+
+def prepare_cleaner_audio_column(dataset, audio_column: str, audio_type):
+    if column_feature_is_audio(dataset, audio_column):
+        return dataset.cast_column(audio_column, audio_type(decode=False))
+    return dataset
+
+
+def normalized_asr_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def parse_duration_seconds(value, column: str = "") -> float:
+    if value in (None, ""):
+        return 0.0
+    text = str(value).strip()
+    if ":" in text:
+        parts = text.split(":")
+        try:
+            numbers = [float(part) for part in parts]
+        except ValueError:
+            numbers = []
+        if len(numbers) == 3:
+            return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+        if len(numbers) == 2:
+            return numbers[0] * 60 + numbers[1]
+
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return 0.0
+        duration = float(match.group(0))
+
+    lower = str(column or "").lower()
+    if lower.endswith("_ms") or lower in {"duration_ms", "milliseconds", "ms"}:
+        duration /= 1000.0
+    elif lower.endswith("_minutes") or lower in {"duration_min", "minutes", "mins"}:
+        duration *= 60.0
+    if duration != duration or duration in (float("inf"), float("-inf")):
+        return 0.0
+    return duration
+
+
+def row_matches_source_filters(row: dict, source_column: str, include_terms: list[str], exclude_terms: list[str]) -> bool:
+    if not source_column:
+        return True
+    source = str(row.get(source_column) or "").lower()
+    if include_terms and not any(term in source for term in include_terms):
+        return False
+    if exclude_terms and any(term in source for term in exclude_terms):
+        return False
+    return True
+
+
+def load_augment_audio_helpers(site_root: Path):
+    helper_path = site_root / "synthetic_cs_dataset" / "scripts" / "augment_audio.py"
+    if not helper_path.exists():
+        raise RuntimeError(f"Audio augmentation helper was not found: {helper_path}")
+
+    module_name = f"augment_audio_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, helper_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load audio augmentation helper from {helper_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fallback_time_stretch(audio, factor: float):
+    import numpy as np
+
+    if audio.size <= 1 or factor <= 0:
+        return audio
+    target_size = max(1, int(round(audio.size / factor)))
+    old_positions = np.linspace(0.0, 1.0, num=audio.size, dtype=np.float32)
+    new_positions = np.linspace(0.0, 1.0, num=target_size, dtype=np.float32)
+    return np.interp(new_positions, old_positions, audio).astype(np.float32)
+
+
+def speed_perturb_audio(audio, sample_rate: int, factor: float, helpers):
+    try:
+        import librosa
+
+        return helpers.peak_limit(librosa.effects.time_stretch(helpers.to_mono(audio), rate=factor))
+    except Exception:
+        return helpers.peak_limit(fallback_time_stretch(helpers.to_mono(audio), factor))
+
+
+def resample_audio(audio, orig_sr: int, target_sr: int):
+    if orig_sr == target_sr:
+        return audio
+    try:
+        import librosa
+
+        return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
+    except Exception:
+        import numpy as np
+
+        if audio.size <= 1:
+            return audio
+        target_size = max(1, int(round(audio.size * (target_sr / orig_sr))))
+        old_positions = np.linspace(0.0, 1.0, num=audio.size, dtype=np.float32)
+        new_positions = np.linspace(0.0, 1.0, num=target_size, dtype=np.float32)
+        return np.interp(new_positions, old_positions, audio).astype(np.float32)
+
+
+def synthetic_noise_profile(kind: str, size: int, sample_rate: int, rng: random.Random):
+    import numpy as np
+
+    np_rng = np.random.default_rng(rng.randint(0, 2**32 - 1))
+    white = np_rng.normal(0.0, 1.0, size=size).astype(np.float32)
+    times = np.arange(size, dtype=np.float32) / max(sample_rate, 1)
+    kind = str(kind or "office").lower()
+
+    if kind == "office":
+        hum = 0.35 * np.sin(2 * np.pi * rng.choice([50.0, 60.0]) * times)
+        noise = 0.65 * white + hum.astype(np.float32)
+    elif kind == "call_center":
+        murmur = np.convolve(white, np.ones(180, dtype=np.float32) / 180, mode="same")
+        noise = 0.55 * white + 0.75 * murmur
+    elif kind == "cafe":
+        clinks = np.zeros(size, dtype=np.float32)
+        for _ in range(max(1, size // max(sample_rate * 2, 1))):
+            start = rng.randrange(0, max(size, 1))
+            length = min(size - start, rng.randrange(80, 360))
+            if length > 0:
+                clinks[start : start + length] += np_rng.normal(0.0, 2.0, size=length).astype(np.float32)
+        noise = 0.7 * white + 0.25 * np.convolve(white, np.ones(60, dtype=np.float32) / 60, mode="same") + 0.05 * clinks
+    elif kind == "street":
+        rumble = np.convolve(white, np.ones(900, dtype=np.float32) / 900, mode="same")
+        noise = 0.45 * white + 1.1 * rumble
+    elif kind == "home":
+        appliance = 0.25 * np.sin(2 * np.pi * rng.uniform(90.0, 140.0) * times)
+        noise = 0.55 * white + appliance.astype(np.float32)
+    else:
+        noise = white
+
+    rms = float(np.sqrt(np.mean(np.square(noise)))) if noise.size else 0.0
+    if rms > 1e-8:
+        noise = noise / rms
+    return noise.astype(np.float32)
+
+
+def add_profile_noise_at_snr(audio, sample_rate: int, rng: random.Random, snr_db: float, profile: str, helpers):
+    import numpy as np
+
+    clean = helpers.to_mono(audio)
+    rms = float(np.sqrt(np.mean(np.square(clean)))) if clean.size else 0.0
+    if rms < 1e-8:
+        return clean
+    noise = synthetic_noise_profile(profile, clean.size, sample_rate, rng)
+    target_noise_rms = rms / (10 ** (snr_db / 20.0))
+    return helpers.peak_limit(clean + (noise * target_noise_rms))
+
+
+def telephony_transform_audio(audio, sample_rate: int, rng: random.Random, helpers):
+    phone_sr = 8000
+    mono = helpers.to_mono(audio)
+    narrow = resample_audio(mono, sample_rate, phone_sr)
+    narrow = helpers.fft_bandpass(narrow, phone_sr, 300.0, 3400.0)
+    narrow = helpers.compress(narrow, threshold=rng.uniform(0.16, 0.28), ratio=rng.uniform(2.0, 3.2))
+    if rng.random() < 0.8:
+        narrow = helpers.mu_law_degrade(narrow)
+    if rng.random() < 0.35:
+        narrow = helpers.add_noise_at_snr(narrow, rng, snr_db=rng.uniform(18.0, 28.0))
+    restored = resample_audio(narrow, phone_sr, sample_rate)
+    restored = helpers.fft_bandpass(restored, sample_rate, 300.0, min(3400.0, sample_rate / 2 - 50))
+    return helpers.rms_normalize(helpers.peak_limit(restored), target_dbfs=-20.0)
+
+
+def gain_transform_audio(audio, rng: random.Random, helpers) -> tuple[object, float]:
+    gain_db = rng.uniform(-6.0, 6.0)
+    gained = helpers.to_mono(audio) * (10 ** (gain_db / 20.0))
+    return helpers.peak_limit(gained), gain_db
+
+
+def audio_value_to_array(value, dataset_path: Path, site_root: Path):
+    import numpy as np
+    import soundfile as sf
+
+    if isinstance(value, dict):
+        array = value.get("array")
+        sampling_rate = value.get("sampling_rate")
+        if array is not None and sampling_rate:
+            return np.asarray(array, dtype=np.float32), int(sampling_rate)
+
+        audio_bytes = value.get("bytes")
+        if audio_bytes:
+            audio, sample_rate = sf.read(io.BytesIO(audio_bytes), always_2d=False)
+            return np.asarray(audio, dtype=np.float32), int(sample_rate)
+
+        path_value = value.get("path") or value.get("file_name") or value.get("audio")
+        if path_value:
+            audio_path = resolve_existing_audio_path(str(path_value), dataset_path, site_root)
+            if audio_path.exists() and audio_path.is_file():
+                audio, sample_rate = sf.read(str(audio_path), always_2d=False)
+                return np.asarray(audio, dtype=np.float32), int(sample_rate)
+            raise FileNotFoundError(f"Audio path was not found: {audio_path}")
+
+    if value:
+        audio_path = resolve_existing_audio_path(str(value), dataset_path, site_root)
+        if audio_path.exists() and audio_path.is_file():
+            audio, sample_rate = sf.read(str(audio_path), always_2d=False)
+            return np.asarray(audio, dtype=np.float32), int(sample_rate)
+        raise FileNotFoundError(f"Audio path was not found: {audio_path}")
+
+    raise FileNotFoundError("Audio value is empty.")
+
+
+def duration_sample_identity(row: dict) -> str:
+    return bad_sample_identity(row)
+
+
+def load_best_asr_text_normalizer(site_root: Path):
+    normalizer_path = site_root / "tools" / "best_asr_text_normalizer.py"
+    if not normalizer_path.exists():
+        raise RuntimeError(f"Text normalizer file was not found: {normalizer_path}")
+
+    module_name = f"best_asr_text_normalizer_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, normalizer_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load text normalizer from {normalizer_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    normalize_fn = getattr(module, "normalize_asr_text", None)
+    if not callable(normalize_fn):
+        raise RuntimeError("best_asr_text_normalizer.py does not expose normalize_asr_text().")
+    return normalize_fn, normalizer_path
+
+
+def resolve_existing_audio_path(path_value: str, dataset_path: Path, site_root: Path) -> Path:
+    raw_text = str(path_value or "").strip().strip("\"'")
+    if not raw_text:
+        return Path()
+
+    raw = Path(raw_text).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+
+    candidates = [
+        (dataset_path / raw).resolve(),
+        (dataset_path.parent / raw).resolve(),
+        (dataset_path.parent / "audio" / raw.name).resolve(),
+        (site_root / raw).resolve(),
+        (site_root / "synthetic_cs_dataset" / raw).resolve(),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def materialize_cleaner_audio(value, dataset_path: Path, site_root: Path) -> tuple[Path | None, Path | None]:
+    path_value = ""
+    bytes_value = None
+    array_value = None
+    sampling_rate = None
+
+    if isinstance(value, dict):
+        path_value = str(value.get("path") or value.get("file_name") or value.get("audio") or "").strip()
+        bytes_value = value.get("bytes")
+        array_value = value.get("array")
+        sampling_rate = value.get("sampling_rate")
+    elif value is not None:
+        path_value = str(value).strip()
+
+    if path_value:
+        path = resolve_existing_audio_path(path_value, dataset_path, site_root)
+        if path.exists():
+            return path, None
+
+    suffix = Path(path_value).suffix if path_value else ".wav"
+    if not suffix:
+        suffix = ".wav"
+
+    if bytes_value:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+            handle.write(bytes_value)
+            return Path(handle.name), Path(handle.name)
+
+    if array_value is not None and sampling_rate:
+        try:
+            import soundfile as sf
+        except ImportError as exc:
+            raise RuntimeError("Install soundfile before cleaning decoded audio arrays.") from exc
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as handle:
+            temp_path = Path(handle.name)
+        sf.write(str(temp_path), array_value, int(sampling_rate))
+        return temp_path, temp_path
+
+    if path_value:
+        return resolve_existing_audio_path(path_value, dataset_path, site_root), None
+    return None, None
+
+
+def cleaner_audio_duration_seconds(path: Path) -> float:
+    try:
+        import librosa
+
+        try:
+            return float(librosa.get_duration(path=str(path)))
+        except TypeError:
+            return float(librosa.get_duration(filename=str(path)))
+    except Exception:
+        try:
+            import soundfile as sf
+        except ImportError as exc:
+            raise RuntimeError("Install librosa or soundfile before checking audio duration.") from exc
+        info = sf.info(str(path))
+        if not info.samplerate:
+            return 0.0
+        return float(info.frames / info.samplerate)
+
+
+def cleaner_jiwer_cer():
+    try:
+        import jiwer
+    except ImportError as exc:
+        raise RuntimeError("Install cleaner dependencies first: pip install openai-whisper jiwer") from exc
+    return jiwer.cer
+
+
+class _HfWhisperPipelineWrapper:
+    """Adapter: transformers ASR pipeline → .transcribe() interface."""
+
+    def __init__(self, pipe):
+        self._pipe = pipe
+
+    def transcribe(self, audio_path, **kwargs):
+        return self._pipe(audio_path, **kwargs)
+
+
+class _HfWhisperPeftWrapper:
+    """Adapter: PEFT-adapted Whisper model → .transcribe() interface.
+
+    Loads a base Whisper model with a PEFT (LoRA) adapter merged in and
+    exposes the standard .transcribe(path, language=...) API the rest of
+    the codebase expects.
+    """
+
+    _librosa = None
+
+    def __init__(self, model, processor, device):
+        self._model = model
+        self._processor = processor
+        self._device = device
+
+    @staticmethod
+    def _get_librosa():
+        if _HfWhisperPeftWrapper._librosa is None:
+            import librosa
+
+            _HfWhisperPeftWrapper._librosa = librosa
+        return _HfWhisperPeftWrapper._librosa
+
+    def transcribe(self, audio_path, **kwargs):
+        import torch
+        librosa = self._get_librosa()
+
+        audio, sr = librosa.load(str(audio_path), sr=16000)
+
+        input_features = self._processor(
+            audio,
+            sampling_rate=16000,
+            return_tensors="pt",
+        ).input_features.to(self._device)
+
+        generate_kwargs = {}
+        language = kwargs.get("language")
+        task = kwargs.get("task", "transcribe")
+        if language:
+            forced_decoder_ids = self._processor.get_decoder_prompt_ids(
+                language=language, task=task
+            )
+            if forced_decoder_ids:
+                generate_kwargs["forced_decoder_ids"] = forced_decoder_ids
+
+        with torch.no_grad():
+            predicted_ids = self._model.generate(
+                input_features, **generate_kwargs
+            )
+
+        transcription = self._processor.batch_decode(
+            predicted_ids, skip_special_tokens=True
+        )[0]
+
+        return {"text": transcription}
+
+
+def _infer_base_model(model_id: str) -> str:
+    """Infer the base openai Whisper model ID from a fine-tuned HF model name.
+
+    Example: "afyfbadreddine77/whisper-large-v3-turbo-darija" →
+             "openai/whisper-large-v3-turbo"
+    """
+    import re
+    match = re.search(
+        r"whisper-(tiny|base|small|medium|large-v3-turbo|large-v3|large-v2|large)",
+        model_id.lower(),
+    )
+    if match:
+        return f"openai/{match.group(0)}"
+    return "openai/whisper-large-v3-turbo"
+
+
+def get_whisper_model(model_name: str):
+    name = str(model_name or "afyfbadreddine77/whisper-large-v3-turbo-darija").strip()
+    name = name or "afyfbadreddine77/whisper-large-v3-turbo-darija"
+
+    with WHISPER_LOCK:
+        model = WHISPER_MODELS.get(name)
+        if model is not None:
+            return model
+
+        if "/" in name:
+            # --- Hugging Face model ID ---
+
+            # 1) Try standard transformers pipeline (works for properly
+            #    converted HF models).
+            try:
+                import torch
+                from transformers import pipeline as hf_pipeline
+
+                pipe = hf_pipeline(
+                    "automatic-speech-recognition",
+                    model=name,
+                    device=0 if torch.cuda.is_available() else -1,
+                )
+                wrapped = _HfWhisperPipelineWrapper(pipe)
+                WHISPER_MODELS[name] = wrapped
+                return wrapped
+            except Exception:
+                # Fall through — likely a PEFT-only repo or an incompatible
+                # checkpoint format.
+                pass
+
+            # 2) Fallback: PEFT (LoRA) adapter on top of a base Whisper
+            #    model.
+            try:
+                import torch
+                from transformers import (
+                    WhisperForConditionalGeneration,
+                    WhisperProcessor,
+                )
+                from peft import PeftModel
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Install peft + transformers + torch to load PEFT "
+                    "Whisper adapters from Hugging Face:\n"
+                    "pip install peft transformers torch librosa"
+                ) from exc
+
+            base_name = _infer_base_model(name)
+            device = 0 if torch.cuda.is_available() else -1
+            device_str = "cuda" if device == 0 else "cpu"
+
+            base_model = WhisperForConditionalGeneration.from_pretrained(
+                base_name
+            )
+            adapter_model = PeftModel.from_pretrained(base_model, name)
+            adapter_model = adapter_model.merge_and_unload()
+            adapter_model = adapter_model.to(device_str)
+
+            processor = WhisperProcessor.from_pretrained(base_name)
+
+            wrapped = _HfWhisperPeftWrapper(
+                adapter_model, processor, device_str
+            )
+            WHISPER_MODELS[name] = wrapped
+            return wrapped
+
+        # --- Standard openai-whisper model name ---
+        try:
+            import whisper
+        except ImportError as exc:
+            raise RuntimeError(
+                "Install cleaner dependencies first: pip install "
+                "openai-whisper jiwer"
+            ) from exc
+
+        loaded = whisper.load_model(name)
+        WHISPER_MODELS[name] = loaded
+        return loaded
+
+
+def bad_sample_identity(row: dict) -> str:
+    for column in ("id", "file_name", "audio", "audio_path", "path"):
+        value = row.get(column)
+        if value:
+            if isinstance(value, dict):
+                value = value.get("path") or value.get("file_name") or ""
+            return str(value)
+    return ""
+
+
+def evaluate_cleaner_row(
+    row: dict,
+    split: str,
+    index: int,
+    dataset_path: Path,
+    site_root: Path,
+    transcript_column: str,
+    audio_column: str,
+    use_cps: bool,
+    min_cps: float,
+    max_cps: float,
+    use_whisper: bool,
+    whisper_model,
+    cer_fn,
+    cer_threshold: float,
+    language: str,
+) -> tuple[bool, dict]:
+    reasons: list[str] = []
+    details: dict = {
+        "split": split,
+        "row": index,
+        "id": bad_sample_identity(row),
+        "reason": "",
+    }
+
+    expected_text = normalized_asr_text(row.get(transcript_column, ""))
+    details["expected"] = expected_text
+    if not expected_text:
+        reasons.append("missing_transcript")
+
+    temp_audio = None
+    try:
+        audio_path, temp_audio = materialize_cleaner_audio(row.get(audio_column), dataset_path, site_root)
+        if audio_path is not None:
+            details["audio_path"] = str(audio_path)
+        if audio_path is None:
+            reasons.append("missing_audio")
+        elif not audio_path.exists():
+            reasons.append("audio_not_found")
+        elif not audio_path.is_file():
+            reasons.append("audio_not_file")
+        else:
+            if use_cps:
+                try:
+                    duration = cleaner_audio_duration_seconds(audio_path)
+                    details["duration_seconds"] = round(duration, 3)
+                    if duration <= 0:
+                        reasons.append("invalid_duration")
+                    else:
+                        cps = len(expected_text.strip()) / duration if expected_text else 0.0
+                        details["chars_per_second"] = round(cps, 3)
+                        if cps < min_cps or cps > max_cps:
+                            reasons.append("chars_per_second_out_of_range")
+                except Exception as exc:
+                    details["duration_error"] = str(exc)
+                    reasons.append("duration_check_failed")
+
+            if use_whisper and expected_text:
+                try:
+                    kwargs = {"language": language} if language else {}
+                    result = whisper_model.transcribe(str(audio_path), **kwargs)
+                    predicted = normalized_asr_text(result.get("text", ""))
+                    try:
+                        cer = float(cer_fn(expected_text, predicted))
+                    except (ZeroDivisionError, ArithmeticError):
+                        # jiwer.cer (or internal numpy) divides by reference
+                        # length; fails when normalisation empties the text
+                        # (e.g. mixed-script code-switched content). Keep the
+                        # sample — user wants to remove only certain bad data.
+                        cer = 0.0
+                    details["whisper"] = predicted
+                    details["cer"] = round(cer, 4)
+                    if cer > cer_threshold:
+                        reasons.append("cer_above_threshold")
+                except Exception as exc:
+                    details["whisper_error"] = str(exc)
+                    reasons.append("whisper_check_failed")
+    finally:
+        if temp_audio:
+            try:
+                temp_audio.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    details["reason"] = "|".join(reasons)
+    return bool(reasons), details
+
+
+def cleaner_report_path(output_path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return output_path.parent / f"{output_path.name}_cleaner_report_{stamp}.json"
+
+
+def duplicate_report_path(output_path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return output_path.parent / f"{output_path.name}_duplicate_report_{stamp}.json"
+
+
+def duration_filter_report_path(output_path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return output_path.parent / f"{output_path.name}_duration_filter_report_{stamp}.json"
+
+
+def augmentation_report_path(output_path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return output_path.parent / f"{output_path.name}_augmentation_report_{stamp}.json"
+
+
+def text_normalization_report_path(output_path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return output_path.parent / f"{output_path.name}_text_normalization_report_{stamp}.json"
+
+
+def source_removal_report_path(output_path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return output_path.parent / f"{output_path.name}_source_removal_report_{stamp}.json"
+
+
+def normalize_duplicate_text(value: str, normalize: bool) -> str:
+    text = normalized_asr_text(value)
+    if not normalize:
+        return text
+    text = text.lower()
+    text = re.sub(r"[،,.!?؟;:]+", "", text)
+    return normalized_asr_text(text)
+
+
+def duplicate_sample_identity(row: dict) -> str:
+    return bad_sample_identity(row)
+
+
+def duplicate_output_path_for(
+    dataset_path: Path,
+    output_mode: str,
+    output_value: str,
+    overwrite_output: bool,
+    site_root: Path,
+    pipeline_dir: Path,
+) -> Path:
+    if output_mode not in {"copy", "overwrite"}:
+        raise RuntimeError("Save mode must be `copy` or `overwrite`.")
+    if output_mode == "overwrite":
+        return dataset_path
+
+    output_path = (
+        resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+        if output_value
+        else unique_path(dataset_path.with_name(f"{dataset_path.name}_deduped"))
+    )
+    if output_path == dataset_path:
+        raise RuntimeError("Use Override original dataset when the output path is the input path.")
+    if output_path.exists() and not overwrite_output:
+        raise RuntimeError(f"Output path already exists: {output_path}. Enable overwrite or choose a new folder.")
+    return output_path
+
+
+def duration_filter_output_path_for(
+    dataset_path: Path,
+    output_mode: str,
+    output_value: str,
+    overwrite_output: bool,
+    site_root: Path,
+    pipeline_dir: Path,
+) -> Path:
+    if output_mode not in {"copy", "overwrite"}:
+        raise RuntimeError("Save mode must be `copy` or `overwrite`.")
+    if output_mode == "overwrite":
+        return dataset_path
+
+    output_path = (
+        resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+        if output_value
+        else unique_path(dataset_path.with_name(f"{dataset_path.name}_duration_filtered"))
+    )
+    if output_path == dataset_path:
+        raise RuntimeError("Use Override original dataset when the output path is the input path.")
+    if output_path.exists() and not overwrite_output:
+        raise RuntimeError(f"Output path already exists: {output_path}. Enable overwrite or choose a new folder.")
+    return output_path
+
+
+def augmentation_output_path_for(
+    dataset_path: Path,
+    output_mode: str,
+    output_value: str,
+    overwrite_output: bool,
+    site_root: Path,
+    pipeline_dir: Path,
+) -> Path:
+    if output_mode not in {"copy", "overwrite"}:
+        raise RuntimeError("Save mode must be `copy` or `overwrite`.")
+    if output_mode == "overwrite":
+        return dataset_path
+
+    output_path = (
+        resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+        if output_value
+        else unique_path(dataset_path.with_name(f"{dataset_path.name}_augmented"))
+    )
+    if output_path == dataset_path:
+        raise RuntimeError("Use Override original dataset when the output path is the input path.")
+    if output_path.exists() and not overwrite_output:
+        raise RuntimeError(f"Output path already exists: {output_path}. Enable overwrite or choose a new folder.")
+    return output_path
+
+
+def text_normalizer_output_path_for(
+    dataset_path: Path,
+    output_mode: str,
+    output_value: str,
+    overwrite_output: bool,
+    site_root: Path,
+    pipeline_dir: Path,
+) -> Path:
+    if output_mode not in {"copy", "overwrite"}:
+        raise RuntimeError("Save mode must be `copy` or `overwrite`.")
+    if output_mode == "overwrite":
+        return dataset_path
+
+    output_path = (
+        resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+        if output_value
+        else unique_path(dataset_path.with_name(f"{dataset_path.name}_normalized"))
+    )
+    if output_path == dataset_path:
+        raise RuntimeError("Use Override original dataset when the output path is the input path.")
+    if output_path.exists() and not overwrite_output:
+        raise RuntimeError(f"Output path already exists: {output_path}. Enable overwrite or choose a new folder.")
+    return output_path
+
+
+def save_cleaner_dataset(cleaned, output_path: Path, output_mode: str, site_root: Path, pipeline_dir: Path) -> None:
+    if output_mode == "overwrite":
+        temp_output = output_path.with_name(f".{output_path.name}.cleaner-{uuid.uuid4().hex[:8]}")
+        temp_output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            cleaned.save_to_disk(str(temp_output))
+            guarded_remove_output(output_path, site_root, pipeline_dir)
+            shutil.move(str(temp_output), str(output_path))
+        finally:
+            if temp_output.exists():
+                try:
+                    guarded_remove_output(temp_output, site_root, pipeline_dir)
+                except Exception:
+                    pass
+        return
+
+    if output_path.exists():
+        guarded_remove_output(output_path, site_root, pipeline_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned.save_to_disk(str(output_path))
+
+
+def run_text_normalizer_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    output_path: Path | None = None
+    try:
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        if not dataset_value:
+            raise RuntimeError("Missing dataset path.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Dataset path was not found: {dataset_path}")
+
+        output_mode = str(params.get("output_mode") or "copy").strip()
+        output_value = str(params.get("output_path") or "").strip()
+        overwrite_output = cleaner_bool(params, "overwrite_output", False)
+        output_path = text_normalizer_output_path_for(
+            dataset_path,
+            output_mode,
+            output_value,
+            overwrite_output,
+            site_root,
+            pipeline_dir,
+        )
+
+        output_column = str(params.get("output_column") or "normalized_text").strip() or "normalized_text"
+        overwrite_text = cleaner_bool(params, "overwrite_text", False)
+        language_column_request = str(params.get("language_column") or "").strip()
+        fixed_language = str(params.get("language") or "").strip()
+        strip_latin_accents = cleaner_bool(params, "strip_latin_accents", False)
+        ta_marbuta_style = str(params.get("ta_marbuta_style") or "keep").strip() or "keep"
+        if ta_marbuta_style not in {"keep", "h"}:
+            raise RuntimeError("Ta marbuta style must be `keep` or `h`.")
+
+        update_cleaner_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=5,
+            message=f"Loading dataset from {dataset_path}",
+            result={"input_path": str(dataset_path), "output_path": str(output_path)},
+        )
+
+        try:
+            from datasets import Dataset, DatasetDict, load_from_disk
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before normalizing datasets.") from exc
+
+        normalize_asr_text, normalizer_path = load_best_asr_text_normalizer(site_root)
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            split_map = dict(loaded.items())
+            single_dataset = False
+        elif isinstance(loaded, Dataset):
+            split_map = {"train": loaded}
+            single_dataset = True
+        else:
+            raise RuntimeError(f"Unsupported Hugging Face dataset type at {dataset_path}")
+
+        transcript_column = infer_common_cleaner_column(
+            split_map,
+            str(params.get("transcript_column") or "").strip(),
+            TRANSCRIPT_COLUMN_CANDIDATES,
+            "Transcript",
+        )
+        if overwrite_text:
+            output_column = transcript_column
+
+        language_column = ""
+        first_dataset = next(iter(split_map.values()))
+        first_columns = list(getattr(first_dataset, "column_names", []) or [])
+        if language_column_request:
+            language_column = match_column(first_columns, language_column_request)
+            if not language_column:
+                raise RuntimeError(f"Language column was not found: {language_column_request}")
+            missing = [
+                split
+                for split, dataset in split_map.items()
+                if language_column not in list(getattr(dataset, "column_names", []) or [])
+            ]
+            if missing:
+                raise RuntimeError(f"Language column `{language_column}` is missing from split(s): {', '.join(missing)}")
+        else:
+            language_column = match_column(first_columns, "lang")
+            if language_column:
+                missing = [
+                    split
+                    for split, dataset in split_map.items()
+                    if language_column not in list(getattr(dataset, "column_names", []) or [])
+                ]
+                if missing:
+                    language_column = ""
+
+        rows_by_split = {split: len(dataset) for split, dataset in split_map.items()}
+        total_rows = sum(rows_by_split.values())
+        if total_rows <= 0:
+            raise RuntimeError("The dataset has no rows to normalize.")
+
+        normalized_splits = {}
+        processed = 0
+        changed_rows = 0
+        changed_by_split: dict[str, int] = {}
+        preview: list[dict] = []
+        last_update = 0.0
+
+        update_cleaner_job(
+            job_id,
+            stage="Normalizing",
+            percent=10,
+            message=f"Normalizing `{transcript_column}` into `{output_column}`.",
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "transcript_column": transcript_column,
+                "output_column": output_column,
+                "rows_by_split": rows_by_split,
+            },
+        )
+
+        for split, dataset in split_map.items():
+            split_changed = 0
+
+            def normalize_row(row: dict, index: int) -> dict:
+                nonlocal processed, changed_rows, split_changed, last_update
+                raw_text = str(row.get(transcript_column) or "")
+                row_language = fixed_language
+                if not row_language and language_column:
+                    row_language = str(row.get(language_column) or "").strip()
+
+                normalized = normalize_asr_text(
+                    raw_text,
+                    row_language or None,
+                    strip_latin_accents=strip_latin_accents,
+                    ta_marbuta_style=ta_marbuta_style,
+                )
+                row[output_column] = normalized
+
+                if normalized != normalized_asr_text(raw_text):
+                    changed_rows += 1
+                    split_changed += 1
+                    if len(preview) < 25:
+                        preview.append(
+                            {
+                                "split": split,
+                                "row": index,
+                                "id": bad_sample_identity(row),
+                                "original": raw_text,
+                                "normalized": normalized,
+                            }
+                        )
+
+                processed += 1
+                now = time.time()
+                if now - last_update >= 1.2 or processed == total_rows:
+                    percent = 10 + min(78, (processed / total_rows) * 78)
+                    update_cleaner_job(
+                        job_id,
+                        stage="Normalizing",
+                        percent=round(percent, 1),
+                        message=(
+                            f"Normalized {processed}/{total_rows} row(s). "
+                            f"Changed {changed_rows} transcript(s)."
+                        ),
+                        result={
+                            "input_path": str(dataset_path),
+                            "output_path": str(output_path),
+                            "processed_rows": processed,
+                            "changed_rows": changed_rows,
+                            "rows_by_split": rows_by_split,
+                        },
+                    )
+                    last_update = now
+                return row
+
+            normalized_splits[split] = dataset.map(normalize_row, with_indices=True)
+            changed_by_split[split] = split_changed
+
+        normalized_dataset = normalized_splits["train"] if single_dataset else DatasetDict(normalized_splits)
+
+        update_cleaner_job(
+            job_id,
+            stage="Saving",
+            percent=92,
+            message=f"Saving normalized dataset to {output_path}",
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "total_rows": total_rows,
+                "changed_rows": changed_rows,
+                "changed_by_split": changed_by_split,
+                "transcript_column": transcript_column,
+                "output_column": output_column,
+            },
+        )
+
+        save_cleaner_dataset(normalized_dataset, output_path, output_mode, site_root, pipeline_dir)
+
+        report_path = text_normalization_report_path(output_path)
+        result = {
+            "input_path": str(dataset_path),
+            "output_path": str(output_path),
+            "output_mode": output_mode,
+            "report_path": str(report_path),
+            "total_rows": total_rows,
+            "changed_rows": changed_rows,
+            "rows_by_split": rows_by_split,
+            "changed_by_split": changed_by_split,
+            "transcript_column": transcript_column,
+            "output_column": output_column,
+            "language_column": language_column,
+            "fixed_language": fixed_language,
+            "strip_latin_accents": strip_latin_accents,
+            "ta_marbuta_style": ta_marbuta_style,
+            "normalizer_path": str(normalizer_path),
+            "normalized_samples_preview": preview,
+        }
+        report_payload = dict(result)
+        report_payload["normalized_samples"] = preview
+        report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        DatasetViewerHandler.dataset_cache.clear()
+        DatasetViewerHandler.dataset_path = output_path
+
+        update_cleaner_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Normalized {total_rows} row(s). Dataset: {output_path}",
+            result=result,
+        )
+    except Exception as exc:
+        update_cleaner_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Transcript normalization failed.",
+            error=str(exc),
+            log_tail=str(exc),
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def run_dataset_cleaner_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    temp_output: Path | None = None
+    output_path: Path | None = None
+    try:
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        if not dataset_value:
+            raise RuntimeError("Missing dataset path.")
+
+        output_mode = str(params.get("output_mode") or "copy").strip()
+        if output_mode not in {"copy", "overwrite"}:
+            raise RuntimeError("Save mode must be `copy` or `overwrite`.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Dataset path was not found: {dataset_path}")
+
+        output_value = str(params.get("output_path") or "").strip()
+        overwrite_output = cleaner_bool(params, "overwrite_output", False)
+        if output_mode == "overwrite":
+            output_path = dataset_path
+        else:
+            output_path = (
+                resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+                if output_value
+                else unique_path(dataset_path.with_name(f"{dataset_path.name}_cleaned"))
+            )
+            if output_path == dataset_path:
+                raise RuntimeError("Use Override original dataset when the output path is the input path.")
+            if output_path.exists() and not overwrite_output:
+                raise RuntimeError(f"Output path already exists: {output_path}. Enable overwrite or choose a new folder.")
+
+        cer_threshold = parse_cleaner_float(params, "cer_threshold", 0.85)
+        min_cps = parse_cleaner_float(params, "min_cps", 1.5)
+        max_cps = parse_cleaner_float(params, "max_cps", 22)
+        if cer_threshold < 0:
+            raise RuntimeError("CER threshold must be 0 or greater.")
+        if min_cps <= 0 or max_cps <= 0 or min_cps > max_cps:
+            raise RuntimeError("Chars/sec bounds must be positive, with min <= max.")
+
+        use_whisper = cleaner_bool(params, "use_whisper", True)
+        use_cps = cleaner_bool(params, "use_cps", True)
+        if not use_whisper and not use_cps:
+            raise RuntimeError("Enable at least one cleaning check.")
+
+        whisper_model_name = str(params.get("whisper_model") or "afyfbadreddine77/whisper-large-v3-turbo-darija").strip() or "afyfbadreddine77/whisper-large-v3-turbo-darija"
+        language = str(params.get("language") or "").strip()
+
+        update_cleaner_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=5,
+            message=f"Loading dataset from {dataset_path}",
+            result={"input_path": str(dataset_path), "output_path": str(output_path)},
+        )
+
+        try:
+            from datasets import Audio, Dataset, DatasetDict, load_from_disk
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before cleaning datasets.") from exc
+
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            split_map = dict(loaded.items())
+            single_dataset = False
+        elif isinstance(loaded, Dataset):
+            split_map = {"train": loaded}
+            single_dataset = True
+        else:
+            raise RuntimeError(f"Unsupported Hugging Face dataset type at {dataset_path}")
+
+        transcript_column = infer_common_cleaner_column(
+            split_map,
+            str(params.get("transcript_column") or "").strip(),
+            TRANSCRIPT_COLUMN_CANDIDATES,
+            "Transcript",
+        )
+        audio_column = infer_common_cleaner_column(
+            split_map,
+            str(params.get("audio_column") or "").strip(),
+            AUDIO_COLUMN_CANDIDATES,
+            "Audio",
+            audio=True,
+        )
+
+        cer_fn = None
+        whisper_model = None
+        if use_whisper:
+            cer_fn = cleaner_jiwer_cer()
+            update_cleaner_job(
+                job_id,
+                stage="Loading Whisper",
+                percent=12,
+                message=f"Loading Whisper model: {whisper_model_name}",
+            )
+            whisper_model = get_whisper_model(whisper_model_name)
+
+        rows_by_split = {split: len(dataset) for split, dataset in split_map.items()}
+        total_rows = sum(rows_by_split.values())
+        if total_rows <= 0:
+            raise RuntimeError("The dataset has no rows to clean.")
+
+        cleaned_splits = {}
+        kept_by_split: dict[str, int] = {}
+        removed_by_split: dict[str, int] = {}
+        bad_samples: list[dict] = []
+        processed = 0
+        last_update = 0.0
+
+        consecutive_whisper_errors = 0
+        first_whisper_error = ""
+
+        for split, dataset in split_map.items():
+            prepared = prepare_cleaner_audio_column(dataset, audio_column, Audio)
+            good_indices: list[int] = []
+            for index in range(len(prepared)):
+                row = dict(prepared[index])
+                is_bad, details = evaluate_cleaner_row(
+                    row,
+                    split,
+                    index,
+                    dataset_path,
+                    site_root,
+                    transcript_column,
+                    audio_column,
+                    use_cps,
+                    min_cps,
+                    max_cps,
+                    use_whisper,
+                    whisper_model,
+                    cer_fn,
+                    cer_threshold,
+                    language,
+                )
+
+                # Track consecutive Whisper failures — if the model is
+                # broken (OOM, missing GPU, wrong format, etc.) every
+                # sample will error. Abort early instead of silently
+                # flagging every sample as bad.
+                whisper_err = details.get("whisper_error", "")
+                if whisper_err:
+                    consecutive_whisper_errors += 1
+                    if not first_whisper_error:
+                        first_whisper_error = whisper_err
+                    if consecutive_whisper_errors >= 5:
+                        raise RuntimeError(
+                            f"Whisper model failed on {consecutive_whisper_errors} consecutive samples. "
+                            f"The model may be broken, too slow on CPU, or misconfigured. "
+                            f"First error: {first_whisper_error}"
+                        )
+                else:
+                    consecutive_whisper_errors = 0
+
+                if is_bad:
+                    bad_samples.append(details)
+                else:
+                    good_indices.append(index)
+
+                processed += 1
+                now = time.time()
+                if now - last_update >= 1.2 or processed == total_rows:
+                    percent = 18 + min(70, (processed / total_rows) * 70)
+                    progress_msg = (
+                        f"Checked {processed}/{total_rows} sample(s). "
+                        f"Marked {len(bad_samples)} for removal."
+                    )
+                    if consecutive_whisper_errors >= 2:
+                        progress_msg += (
+                            f" ⚠ Whisper failing on {consecutive_whisper_errors} consecutive "
+                            f"samples. Error: {first_whisper_error[:200]}"
+                        )
+                    update_cleaner_job(
+                        job_id,
+                        stage="Checking samples",
+                        percent=round(percent, 1),
+                        message=progress_msg,
+                        result={
+                            "input_path": str(dataset_path),
+                            "output_path": str(output_path),
+                            "processed_rows": processed,
+                            "removed_rows": len(bad_samples),
+                            "rows_by_split": rows_by_split,
+                        },
+                    )
+                    last_update = now
+
+            cleaned_splits[split] = prepared.select(good_indices)
+            kept_by_split[split] = len(good_indices)
+            removed_by_split[split] = len(prepared) - len(good_indices)
+
+        cleaned = cleaned_splits["train"] if single_dataset else DatasetDict(cleaned_splits)
+        removed_rows = len(bad_samples)
+        kept_rows = sum(kept_by_split.values())
+
+        update_cleaner_job(
+            job_id,
+            stage="Saving",
+            percent=92,
+            message=f"Saving cleaned dataset to {output_path}",
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "total_rows": total_rows,
+                "kept_rows": kept_rows,
+                "removed_rows": removed_rows,
+                "kept_by_split": kept_by_split,
+                "removed_by_split": removed_by_split,
+            },
+        )
+
+        if output_mode == "overwrite":
+            temp_output = output_path.with_name(f".{output_path.name}.cleaner-{uuid.uuid4().hex[:8]}")
+            temp_output.parent.mkdir(parents=True, exist_ok=True)
+            cleaned.save_to_disk(str(temp_output))
+            guarded_remove_output(output_path, site_root, pipeline_dir)
+            shutil.move(str(temp_output), str(output_path))
+            temp_output = None
+        else:
+            if output_path.exists():
+                guarded_remove_output(output_path, site_root, pipeline_dir)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cleaned.save_to_disk(str(output_path))
+
+        report_path = cleaner_report_path(output_path)
+        result = {
+            "input_path": str(dataset_path),
+            "output_path": str(output_path),
+            "output_mode": output_mode,
+            "report_path": str(report_path),
+            "total_rows": total_rows,
+            "kept_rows": kept_rows,
+            "removed_rows": removed_rows,
+            "rows_by_split": rows_by_split,
+            "kept_by_split": kept_by_split,
+            "removed_by_split": removed_by_split,
+            "transcript_column": transcript_column,
+            "audio_column": audio_column,
+            "checks": {
+                "whisper": use_whisper,
+                "whisper_model": whisper_model_name if use_whisper else "",
+                "language": language,
+                "cer_threshold": cer_threshold,
+                "chars_per_second": use_cps,
+                "min_cps": min_cps,
+                "max_cps": max_cps,
+            },
+            "bad_samples_preview": bad_samples[:25],
+        }
+        report_payload = dict(result)
+        report_payload["bad_samples"] = bad_samples
+        report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        DatasetViewerHandler.dataset_cache.clear()
+        DatasetViewerHandler.dataset_path = output_path
+
+        update_cleaner_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Removed {removed_rows} bad sample(s). Cleaned dataset: {output_path}",
+            result=result,
+        )
+    except Exception as exc:
+        if temp_output and temp_output.exists():
+            try:
+                guarded_remove_output(temp_output, site_root, pipeline_dir)
+            except Exception:
+                pass
+        update_cleaner_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Dataset cleaner failed.",
+            error=str(exc),
+            log_tail=str(exc),
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def duration_column_report_path(output_path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return output_path.parent / f"{output_path.name}_duration_column_report_{stamp}.json"
+
+
+def run_duration_column_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    temp_output: Path | None = None
+    output_path: Path | None = None
+    try:
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        if not dataset_value:
+            raise RuntimeError("Missing dataset path.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Dataset path was not found: {dataset_path}")
+
+        output_mode = str(params.get("output_mode") or "copy").strip()
+        output_value = str(params.get("output_path") or "").strip()
+        overwrite_output = cleaner_bool(params, "overwrite_output", False)
+
+        if output_mode == "overwrite":
+            output_path = dataset_path
+        else:
+            output_path = (
+                resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+                if output_value
+                else unique_path(dataset_path.with_name(f"{dataset_path.name}_with_duration"))
+            )
+            if output_path == dataset_path:
+                raise RuntimeError("Use Override original dataset when the output path is the input path.")
+            if output_path.exists() and not overwrite_output:
+                raise RuntimeError(f"Output path already exists: {output_path}. Enable overwrite or choose a new folder.")
+
+        update_cleaner_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=3,
+            message=f"Loading dataset from {dataset_path}",
+            result={"input_path": str(dataset_path), "output_path": str(output_path)},
+        )
+
+        try:
+            from datasets import Audio, Dataset, DatasetDict, load_from_disk
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before cleaning datasets.") from exc
+
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            split_map = dict(loaded.items())
+            single_dataset = False
+        elif isinstance(loaded, Dataset):
+            split_map = {"train": loaded}
+            single_dataset = True
+        else:
+            raise RuntimeError(f"Unsupported Hugging Face dataset type at {dataset_path}")
+
+        audio_column = infer_common_cleaner_column(
+            split_map,
+            str(params.get("audio_column") or "").strip(),
+            AUDIO_COLUMN_CANDIDATES,
+            "Audio",
+            audio=True,
+        )
+
+        rows_by_split = {split: len(dataset) for split, dataset in split_map.items()}
+        total_rows = sum(rows_by_split.values())
+        if total_rows <= 0:
+            raise RuntimeError("The dataset has no rows.")
+
+        cleaned_splits = {}
+        row_counts: dict[str, int] = {}
+        duration_row_counts: dict[str, int] = {}
+        processed = 0
+        last_update = 0.0
+
+        new_column_name = str(params.get("column_name") or DURATION_COLUMN_NAME).strip() or DURATION_COLUMN_NAME
+
+        for split, dataset in split_map.items():
+            # Check if column already exists
+            existing_columns = list(getattr(dataset, "column_names", []) or [])
+            if new_column_name in existing_columns:
+                raise RuntimeError(
+                    f"Column '{new_column_name}' already exists in split '{split}'. "
+                    f"Choose a different name or remove the column first."
+                )
+
+            prepared = prepare_cleaner_audio_column(dataset, audio_column, Audio)
+            durations: list[float] = []
+            failed_rows = 0
+
+            for index in range(len(prepared)):
+                row = dict(prepared[index])
+                duration = 0.0
+                temp_audio = None
+                try:
+                    audio_path, temp_audio = materialize_cleaner_audio(
+                        row.get(audio_column), dataset_path, site_root
+                    )
+                    if audio_path is not None and audio_path.exists() and audio_path.is_file():
+                        duration = cleaner_audio_duration_seconds(audio_path)
+                    else:
+                        failed_rows += 1
+                except Exception:
+                    failed_rows += 1
+                finally:
+                    if temp_audio:
+                        try:
+                            temp_audio.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+                durations.append(round(duration, 3))
+                processed += 1
+
+                now = time.time()
+                if now - last_update >= 1.2 or processed == total_rows:
+                    percent = 5 + min(85, (processed / total_rows) * 85)
+                    msg = f"Processed {processed}/{total_rows} row(s)."
+                    if failed_rows:
+                        msg += f" {failed_rows} audio(s) not found (duration=0)."
+                    update_cleaner_job(
+                        job_id,
+                        stage="Computing durations",
+                        percent=round(percent, 1),
+                        message=msg,
+                        result={
+                            "input_path": str(dataset_path),
+                            "output_path": str(output_path),
+                            "processed_rows": processed,
+                            "total_rows": total_rows,
+                            "failed_rows": failed_rows,
+                        },
+                    )
+                    last_update = now
+
+            # Add the duration column
+            enriched = dataset.add_column(name=new_column_name, column=durations)
+            cleaned_splits[split] = enriched
+            row_counts[split] = len(enriched)
+            duration_row_counts[split] = len(durations)
+
+        cleaned = cleaned_splits["train"] if single_dataset else DatasetDict(cleaned_splits)
+        total_duration = sum(
+            sum(dataset[new_column_name]) for split, dataset in cleaned_splits.items()
+        )
+
+        update_cleaner_job(
+            job_id,
+            stage="Saving",
+            percent=90,
+            message=f"Saving dataset with '{new_column_name}' column to {output_path}",
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "total_rows": total_rows,
+                "column_name": new_column_name,
+                "total_hours": round(total_duration / 3600.0, 3),
+                "row_counts": row_counts,
+            },
+        )
+
+        if output_mode == "overwrite":
+            temp_output = output_path.with_name(f".{output_path.name}.dcol-{uuid.uuid4().hex[:8]}")
+            temp_output.parent.mkdir(parents=True, exist_ok=True)
+            cleaned.save_to_disk(str(temp_output))
+            guarded_remove_output(output_path, site_root, pipeline_dir)
+            shutil.move(str(temp_output), str(output_path))
+            temp_output = None
+        else:
+            if output_path.exists():
+                guarded_remove_output(output_path, site_root, pipeline_dir)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cleaned.save_to_disk(str(output_path))
+
+        DatasetViewerHandler.dataset_cache.clear()
+
+        report_path = duration_column_report_path(output_path)
+        result = {
+            "input_path": str(dataset_path),
+            "output_path": str(output_path),
+            "output_mode": output_mode,
+            "report_path": str(report_path),
+            "total_rows": total_rows,
+            "column_name": new_column_name,
+            "total_hours": round(total_duration / 3600.0, 3),
+            "row_counts": row_counts,
+        }
+        try:
+            with open(report_path, "w", encoding="utf-8") as handle:
+                json.dump(result, handle, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        update_cleaner_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Added '{new_column_name}' column ({round(total_duration/3600.0, 2)}h) to {output_path}",
+            result=result,
+        )
+    except Exception as exc:
+        update_cleaner_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Duration column generation failed.",
+            error=str(exc),
+            log_tail=str(exc),
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def run_source_removal_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    temp_output: Path | None = None
+    output_path: Path | None = None
+    try:
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        if not dataset_value:
+            raise RuntimeError("Missing dataset path.")
+
+        output_mode = str(params.get("output_mode") or "copy").strip()
+        if output_mode not in {"copy", "overwrite"}:
+            raise RuntimeError("Save mode must be `copy` or `overwrite`.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Dataset path was not found: {dataset_path}")
+
+        source_column_request = str(params.get("source_column") or "source").strip() or "source"
+        remove_sources_value = str(params.get("remove_sources") or "")
+        remove_sources = [s.strip() for s in remove_sources_value.split(",") if s.strip()]
+        remove_set = {s.lower() for s in remove_sources}
+        if not remove_set:
+            raise RuntimeError("Enter at least one source to remove.")
+
+        output_value = str(params.get("output_path") or "").strip()
+        overwrite_output = cleaner_bool(params, "overwrite_output", False)
+        if output_mode == "overwrite":
+            output_path = dataset_path
+        else:
+            output_path = (
+                resolve_hf_dataset_path(output_value, site_root, pipeline_dir, must_exist=False)
+                if output_value
+                else unique_path(dataset_path.with_name(f"{dataset_path.name}_sources_removed"))
+            )
+            if output_path == dataset_path:
+                raise RuntimeError("Use Override original dataset when the output path is the input path.")
+            if output_path.exists() and not overwrite_output:
+                raise RuntimeError(
+                    f"Output path already exists: {output_path}. Enable overwrite or choose a new folder."
+                )
+
+        update_cleaner_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=5,
+            message=f"Loading dataset from {dataset_path}",
+            result={"input_path": str(dataset_path), "output_path": str(output_path)},
+        )
+
+        try:
+            from datasets import Dataset, DatasetDict, load_from_disk
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before cleaning datasets.") from exc
+
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            split_map = dict(loaded.items())
+            single_dataset = False
+        elif isinstance(loaded, Dataset):
+            split_map = {"train": loaded}
+            single_dataset = True
+        else:
+            raise RuntimeError(f"Unsupported Hugging Face dataset type at {dataset_path}")
+
+        source_column = infer_common_cleaner_column(
+            split_map,
+            source_column_request,
+            ["source"],
+            "Source",
+        )
+
+        rows_by_split = {split: len(dataset) for split, dataset in split_map.items()}
+        total_rows = sum(rows_by_split.values())
+        if total_rows <= 0:
+            raise RuntimeError("The dataset has no rows to filter.")
+
+        cleaned_splits = {}
+        kept_by_split: dict[str, int] = {}
+        removed_by_split: dict[str, int] = {}
+        processed = 0
+        removed_rows = 0
+        last_update = 0.0
+
+        for split, dataset in split_map.items():
+            good_indices: list[int] = []
+            for index in range(len(dataset)):
+                row = dict(dataset[index])
+                source_value = str(row.get(source_column) or "").strip().lower()
+                if source_value and source_value in remove_set:
+                    removed_rows += 1
+                else:
+                    good_indices.append(index)
+
+                processed += 1
+                now = time.time()
+                if now - last_update >= 1.2 or processed == total_rows:
+                    percent = 10 + min(78, (processed / total_rows) * 78)
+                    update_cleaner_job(
+                        job_id,
+                        stage="Filtering",
+                        percent=round(percent, 1),
+                        message=(
+                            f"Checked {processed}/{total_rows} row(s). "
+                            f"Removed {removed_rows} row(s) so far."
+                        ),
+                        result={
+                            "input_path": str(dataset_path),
+                            "output_path": str(output_path),
+                            "processed_rows": processed,
+                            "removed_rows": removed_rows,
+                            "rows_by_split": rows_by_split,
+                        },
+                    )
+                    last_update = now
+
+            cleaned_splits[split] = dataset.select(good_indices)
+            kept_by_split[split] = len(good_indices)
+            removed_by_split[split] = len(dataset) - len(good_indices)
+
+        cleaned = cleaned_splits["train"] if single_dataset else DatasetDict(cleaned_splits)
+        kept_rows = sum(kept_by_split.values())
+
+        update_cleaner_job(
+            job_id,
+            stage="Saving",
+            percent=92,
+            message=f"Saving filtered dataset to {output_path}",
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "total_rows": total_rows,
+                "kept_rows": kept_rows,
+                "removed_rows": removed_rows,
+                "kept_by_split": kept_by_split,
+                "removed_by_split": removed_by_split,
+            },
+        )
+
+        if output_mode == "overwrite":
+            temp_output = output_path.with_name(f".{output_path.name}.source-removal-{uuid.uuid4().hex[:8]}")
+            temp_output.parent.mkdir(parents=True, exist_ok=True)
+            cleaned.save_to_disk(str(temp_output))
+            guarded_remove_output(output_path, site_root, pipeline_dir)
+            shutil.move(str(temp_output), str(output_path))
+            temp_output = None
+        else:
+            if output_path.exists():
+                guarded_remove_output(output_path, site_root, pipeline_dir)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cleaned.save_to_disk(str(output_path))
+
+        report_path = source_removal_report_path(output_path)
+        result = {
+            "input_path": str(dataset_path),
+            "output_path": str(output_path),
+            "output_mode": output_mode,
+            "report_path": str(report_path),
+            "total_rows": total_rows,
+            "kept_rows": kept_rows,
+            "removed_rows": removed_rows,
+            "rows_by_split": rows_by_split,
+            "kept_by_split": kept_by_split,
+            "removed_by_split": removed_by_split,
+            "source_column": source_column,
+            "remove_sources": remove_sources,
+        }
+        report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        DatasetViewerHandler.dataset_cache.clear()
+        DatasetViewerHandler.dataset_path = output_path
+
+        update_cleaner_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Removed {removed_rows} row(s) by source. Dataset: {output_path}",
+            result=result,
+        )
+    except Exception as exc:
+        if temp_output and temp_output.exists():
+            try:
+                guarded_remove_output(temp_output, site_root, pipeline_dir)
+            except Exception:
+                pass
+        update_cleaner_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Source removal failed.",
+            error=str(exc),
+            log_tail=str(exc),
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def run_duplicate_cleaner_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    output_path: Path | None = None
+    try:
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        if not dataset_value:
+            raise RuntimeError("Missing dataset path.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Dataset path was not found: {dataset_path}")
+
+        output_mode = str(params.get("output_mode") or "copy").strip()
+        output_value = str(params.get("output_path") or "").strip()
+        overwrite_output = cleaner_bool(params, "overwrite_output", False)
+        normalize_text = cleaner_bool(params, "normalize_text", True)
+        output_path = duplicate_output_path_for(
+            dataset_path,
+            output_mode,
+            output_value,
+            overwrite_output,
+            site_root,
+            pipeline_dir,
+        )
+
+        update_cleaner_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=5,
+            message=f"Loading dataset from {dataset_path}",
+            result={"input_path": str(dataset_path), "output_path": str(output_path)},
+        )
+
+        try:
+            from datasets import Dataset, DatasetDict, load_from_disk
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before cleaning datasets.") from exc
+
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            split_map = dict(loaded.items())
+            single_dataset = False
+        elif isinstance(loaded, Dataset):
+            split_map = {"train": loaded}
+            single_dataset = True
+        else:
+            raise RuntimeError(f"Unsupported Hugging Face dataset type at {dataset_path}")
+
+        transcript_column = infer_common_cleaner_column(
+            split_map,
+            str(params.get("transcript_column") or "").strip(),
+            TRANSCRIPT_COLUMN_CANDIDATES,
+            "Transcript",
+        )
+
+        rows_by_split = {split: len(dataset) for split, dataset in split_map.items()}
+        total_rows = sum(rows_by_split.values())
+        if total_rows <= 0:
+            raise RuntimeError("The dataset has no rows to deduplicate.")
+
+        seen: dict[str, dict] = {}
+        duplicate_samples: list[dict] = []
+        duplicate_groups: set[str] = set()
+        cleaned_splits = {}
+        kept_by_split: dict[str, int] = {}
+        removed_by_split: dict[str, int] = {}
+        processed = 0
+        last_update = 0.0
+
+        for split, dataset in split_map.items():
+            good_indices: list[int] = []
+            for index in range(len(dataset)):
+                row = dict(dataset[index])
+                text = str(row.get(transcript_column) or "")
+                key = normalize_duplicate_text(text, normalize_text)
+                if not key:
+                    good_indices.append(index)
+                elif key in seen:
+                    first = seen[key]
+                    duplicate_groups.add(key)
+                    duplicate_samples.append(
+                        {
+                            "split": split,
+                            "row": index,
+                            "id": duplicate_sample_identity(row),
+                            "text": normalized_asr_text(text),
+                            "duplicate_key": key,
+                            "duplicate_of": {
+                                "split": first.get("split"),
+                                "row": first.get("row"),
+                                "id": first.get("id"),
+                            },
+                            "reason": "duplicate_text",
+                        }
+                    )
+                else:
+                    seen[key] = {
+                        "split": split,
+                        "row": index,
+                        "id": duplicate_sample_identity(row),
+                    }
+                    good_indices.append(index)
+
+                processed += 1
+                now = time.time()
+                if now - last_update >= 1.2 or processed == total_rows:
+                    percent = 12 + min(76, (processed / total_rows) * 76)
+                    update_cleaner_job(
+                        job_id,
+                        stage="Finding duplicates",
+                        percent=round(percent, 1),
+                        message=(
+                            f"Checked {processed}/{total_rows} sample(s). "
+                            f"Found {len(duplicate_samples)} duplicate row(s)."
+                        ),
+                        result={
+                            "input_path": str(dataset_path),
+                            "output_path": str(output_path),
+                            "processed_rows": processed,
+                            "removed_rows": len(duplicate_samples),
+                            "duplicate_groups": len(duplicate_groups),
+                            "rows_by_split": rows_by_split,
+                        },
+                    )
+                    last_update = now
+
+            cleaned_splits[split] = dataset.select(good_indices)
+            kept_by_split[split] = len(good_indices)
+            removed_by_split[split] = len(dataset) - len(good_indices)
+
+        cleaned = cleaned_splits["train"] if single_dataset else DatasetDict(cleaned_splits)
+        removed_rows = len(duplicate_samples)
+        kept_rows = sum(kept_by_split.values())
+
+        update_cleaner_job(
+            job_id,
+            stage="Saving",
+            percent=92,
+            message=f"Saving deduplicated dataset to {output_path}",
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "total_rows": total_rows,
+                "kept_rows": kept_rows,
+                "removed_rows": removed_rows,
+                "duplicate_groups": len(duplicate_groups),
+                "kept_by_split": kept_by_split,
+                "removed_by_split": removed_by_split,
+            },
+        )
+
+        save_cleaner_dataset(cleaned, output_path, output_mode, site_root, pipeline_dir)
+
+        report_path = duplicate_report_path(output_path)
+        result = {
+            "input_path": str(dataset_path),
+            "output_path": str(output_path),
+            "output_mode": output_mode,
+            "report_path": str(report_path),
+            "total_rows": total_rows,
+            "kept_rows": kept_rows,
+            "removed_rows": removed_rows,
+            "duplicate_groups": len(duplicate_groups),
+            "rows_by_split": rows_by_split,
+            "kept_by_split": kept_by_split,
+            "removed_by_split": removed_by_split,
+            "transcript_column": transcript_column,
+            "normalize_text": normalize_text,
+            "duplicate_samples_preview": duplicate_samples[:25],
+        }
+        report_payload = dict(result)
+        report_payload["duplicate_samples"] = duplicate_samples
+        report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        DatasetViewerHandler.dataset_cache.clear()
+        DatasetViewerHandler.dataset_path = output_path
+
+        update_cleaner_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Removed {removed_rows} duplicate sample(s). Deduplicated dataset: {output_path}",
+            result=result,
+        )
+    except Exception as exc:
+        update_cleaner_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Duplicate text cleaner failed.",
+            error=str(exc),
+            log_tail=str(exc),
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def run_duration_filter_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    output_path: Path | None = None
+    try:
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        if not dataset_value:
+            raise RuntimeError("Missing dataset path.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Dataset path was not found: {dataset_path}")
+
+        output_mode = str(params.get("output_mode") or "copy").strip()
+        output_value = str(params.get("output_path") or "").strip()
+        overwrite_output = cleaner_bool(params, "overwrite_output", False)
+        min_seconds = parse_cleaner_float(params, "min_seconds", 1.0)
+        max_seconds = parse_cleaner_float(params, "max_seconds", 30.0)
+        if min_seconds < 0 or max_seconds <= 0 or min_seconds > max_seconds:
+            raise RuntimeError("Duration bounds must be positive, with min <= max.")
+
+        output_path = duration_filter_output_path_for(
+            dataset_path,
+            output_mode,
+            output_value,
+            overwrite_output,
+            site_root,
+            pipeline_dir,
+        )
+
+        update_cleaner_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=5,
+            message=f"Loading dataset from {dataset_path}",
+            result={"input_path": str(dataset_path), "output_path": str(output_path)},
+        )
+
+        try:
+            from datasets import Audio, Dataset, DatasetDict, load_from_disk
+        except ImportError as exc:
+            raise RuntimeError("Install the `datasets` package before cleaning datasets.") from exc
+
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            split_map = dict(loaded.items())
+            single_dataset = False
+        elif isinstance(loaded, Dataset):
+            split_map = {"train": loaded}
+            single_dataset = True
+        else:
+            raise RuntimeError(f"Unsupported Hugging Face dataset type at {dataset_path}")
+
+        duration_column = infer_optional_common_cleaner_column(
+            split_map,
+            str(params.get("duration_column") or "").strip(),
+            DURATION_COLUMN_CANDIDATES,
+            "Duration",
+        )
+        audio_column = ""
+        if not duration_column:
+            audio_column = infer_common_cleaner_column(
+                split_map,
+                str(params.get("audio_column") or "").strip(),
+                AUDIO_COLUMN_CANDIDATES,
+                "Audio",
+                audio=True,
+            )
+
+        rows_by_split = {split: len(dataset) for split, dataset in split_map.items()}
+        total_rows = sum(rows_by_split.values())
+        if total_rows <= 0:
+            raise RuntimeError("The dataset has no rows to filter.")
+
+        duration_samples: list[dict] = []
+        cleaned_splits = {}
+        kept_by_split: dict[str, int] = {}
+        removed_by_split: dict[str, int] = {}
+        short_removed = 0
+        long_removed = 0
+        invalid_removed = 0
+        processed = 0
+        last_update = 0.0
+
+        for split, dataset in split_map.items():
+            prepared = prepare_cleaner_audio_column(dataset, audio_column, Audio) if audio_column else dataset
+            good_indices: list[int] = []
+            for index in range(len(prepared)):
+                row = dict(prepared[index])
+                duration = 0.0
+                details: dict = {
+                    "split": split,
+                    "row": index,
+                    "id": duration_sample_identity(row),
+                    "duration_seconds": 0.0,
+                    "reason": "",
+                }
+                temp_audio = None
+                try:
+                    if duration_column:
+                        duration = parse_duration_seconds(row.get(duration_column), duration_column)
+                        details["duration_source"] = duration_column
+                    else:
+                        audio_path, temp_audio = materialize_cleaner_audio(row.get(audio_column), dataset_path, site_root)
+                        details["duration_source"] = audio_column
+                        if audio_path is not None:
+                            details["audio_path"] = str(audio_path)
+                        if audio_path is None:
+                            details["reason"] = "missing_audio"
+                        elif not audio_path.exists():
+                            details["reason"] = "audio_not_found"
+                        elif not audio_path.is_file():
+                            details["reason"] = "audio_not_file"
+                        else:
+                            duration = cleaner_audio_duration_seconds(audio_path)
+                except Exception as exc:
+                    details["duration_error"] = str(exc)
+                    details["reason"] = "duration_check_failed"
+                finally:
+                    if temp_audio:
+                        try:
+                            temp_audio.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+                details["duration_seconds"] = round(duration, 3)
+                if not details["reason"]:
+                    if duration <= 0:
+                        details["reason"] = "missing_or_invalid_duration"
+                    elif duration < min_seconds:
+                        details["reason"] = "duration_too_short"
+                    elif duration > max_seconds:
+                        details["reason"] = "duration_too_long"
+
+                if details["reason"]:
+                    if details["reason"] == "duration_too_short":
+                        short_removed += 1
+                    elif details["reason"] == "duration_too_long":
+                        long_removed += 1
+                    else:
+                        invalid_removed += 1
+                    duration_samples.append(details)
+                else:
+                    good_indices.append(index)
+
+                processed += 1
+                now = time.time()
+                if now - last_update >= 1.2 or processed == total_rows:
+                    percent = 12 + min(76, (processed / total_rows) * 76)
+                    update_cleaner_job(
+                        job_id,
+                        stage="Filtering durations",
+                        percent=round(percent, 1),
+                        message=(
+                            f"Checked {processed}/{total_rows} sample(s). "
+                            f"Marked {len(duration_samples)} duration row(s) for removal."
+                        ),
+                        result={
+                            "input_path": str(dataset_path),
+                            "output_path": str(output_path),
+                            "processed_rows": processed,
+                            "removed_rows": len(duration_samples),
+                            "rows_by_split": rows_by_split,
+                        },
+                    )
+                    last_update = now
+
+            cleaned_splits[split] = prepared.select(good_indices)
+            kept_by_split[split] = len(good_indices)
+            removed_by_split[split] = len(prepared) - len(good_indices)
+
+        cleaned = cleaned_splits["train"] if single_dataset else DatasetDict(cleaned_splits)
+        removed_rows = len(duration_samples)
+        kept_rows = sum(kept_by_split.values())
+
+        update_cleaner_job(
+            job_id,
+            stage="Saving",
+            percent=92,
+            message=f"Saving duration-filtered dataset to {output_path}",
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "total_rows": total_rows,
+                "kept_rows": kept_rows,
+                "removed_rows": removed_rows,
+                "kept_by_split": kept_by_split,
+                "removed_by_split": removed_by_split,
+            },
+        )
+
+        save_cleaner_dataset(cleaned, output_path, output_mode, site_root, pipeline_dir)
+
+        report_path = duration_filter_report_path(output_path)
+        result = {
+            "input_path": str(dataset_path),
+            "output_path": str(output_path),
+            "output_mode": output_mode,
+            "report_path": str(report_path),
+            "total_rows": total_rows,
+            "kept_rows": kept_rows,
+            "removed_rows": removed_rows,
+            "short_removed": short_removed,
+            "long_removed": long_removed,
+            "invalid_removed": invalid_removed,
+            "rows_by_split": rows_by_split,
+            "kept_by_split": kept_by_split,
+            "removed_by_split": removed_by_split,
+            "duration_column": duration_column,
+            "audio_column": audio_column,
+            "min_seconds": min_seconds,
+            "max_seconds": max_seconds,
+            "duration_samples_preview": duration_samples[:25],
+        }
+        report_payload = dict(result)
+        report_payload["duration_samples"] = duration_samples
+        report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        DatasetViewerHandler.dataset_cache.clear()
+        DatasetViewerHandler.dataset_path = output_path
+
+        update_cleaner_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Removed {removed_rows} duration sample(s). Dataset: {output_path}",
+            result=result,
+        )
+    except Exception as exc:
+        update_cleaner_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Duration filter failed.",
+            error=str(exc),
+            log_tail=str(exc),
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def run_data_augmentation_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    output_path: Path | None = None
+    try:
+        dataset_value = str(params.get("dataset_path") or "").strip()
+        if not dataset_value:
+            raise RuntimeError("Missing dataset path.")
+
+        dataset_path = resolve_hf_dataset_path(dataset_value, site_root, pipeline_dir, must_exist=True)
+        if not dataset_path.exists():
+            raise RuntimeError(f"Dataset path was not found: {dataset_path}")
+
+        output_mode = str(params.get("output_mode") or "copy").strip()
+        output_value = str(params.get("output_path") or "").strip()
+        overwrite_output = cleaner_bool(params, "overwrite_output", False)
+        target_extra_percent = parse_cleaner_float(params, "target_extra_percent", 50.0)
+        if target_extra_percent <= 0:
+            raise RuntimeError("Target extra data percent must be greater than 0.")
+
+        split_name = str(params.get("split") or "train").strip()
+        source_column_request = str(params.get("source_column") or "source").strip()
+        include_terms = collect_filter_terms(params.get("include_source_terms") or "")
+        exclude_terms = collect_filter_terms(
+            params.get("exclude_source_terms") or "darija_codeswitch_asr"
+        )
+        max_copies_per_original = parse_cleaner_int(params, "max_copies_per_original", 2)
+        if max_copies_per_original < 1 or max_copies_per_original > 5:
+            raise RuntimeError("Max copies per original must be between 1 and 5.")
+        seed = parse_cleaner_int(params, "random_seed", 77)
+        rng = random.Random(seed)
+
+        coverage = {
+            "speed": parse_cleaner_float(params, "speed_coverage_percent", 25.0),
+            "noise": parse_cleaner_float(params, "noise_coverage_percent", 25.0),
+            "reverb": parse_cleaner_float(params, "reverb_coverage_percent", 15.0),
+            "telephony": parse_cleaner_float(params, "telephony_coverage_percent", 30.0),
+            "gain": parse_cleaner_float(params, "gain_coverage_percent", 15.0),
+        }
+        if any(value < 0 for value in coverage.values()):
+            raise RuntimeError("Augmentation coverage values must be 0 or greater.")
+        if not any(value > 0 for value in coverage.values()):
+            raise RuntimeError("Enable at least one augmentation coverage value.")
+
+        output_path = augmentation_output_path_for(
+            dataset_path,
+            output_mode,
+            output_value,
+            overwrite_output,
+            site_root,
+            pipeline_dir,
+        )
+        audio_output_dir = output_path.parent / "augmented_audio" / job_id
+        audio_output_dir.mkdir(parents=True, exist_ok=True)
+
+        update_cleaner_job(
+            job_id,
+            status="running",
+            stage="Loading",
+            percent=5,
+            message=f"Loading dataset from {dataset_path}",
+            result={"input_path": str(dataset_path), "output_path": str(output_path)},
+        )
+
+        try:
+            import numpy as np
+            import soundfile as sf
+            from datasets import Audio, Dataset, DatasetDict, concatenate_datasets, load_from_disk
+        except ImportError as exc:
+            raise RuntimeError("Install augmentation dependencies first: pip install datasets soundfile librosa numpy") from exc
+
+        helpers = load_augment_audio_helpers(site_root)
+        loaded = load_from_disk(str(dataset_path))
+        if isinstance(loaded, DatasetDict):
+            split_map = dict(loaded.items())
+            single_dataset = False
+        elif isinstance(loaded, Dataset):
+            split_map = {"train": loaded}
+            single_dataset = True
+        else:
+            raise RuntimeError(f"Unsupported Hugging Face dataset type at {dataset_path}")
+
+        if split_name and split_name not in split_map:
+            raise RuntimeError(f"Split `{split_name}` was not found. Available split(s): {', '.join(split_map)}")
+        target_splits = [split_name] if split_name else list(split_map.keys())
+
+        audio_column = infer_common_cleaner_column(
+            split_map,
+            str(params.get("audio_column") or "").strip(),
+            AUDIO_COLUMN_CANDIDATES,
+            "Audio",
+            audio=True,
+        )
+        duration_column = infer_optional_common_cleaner_column(
+            split_map,
+            str(params.get("duration_column") or "").strip(),
+            DURATION_COLUMN_CANDIDATES,
+            "Duration",
+        )
+        source_column = infer_optional_common_cleaner_column(
+            split_map,
+            source_column_request,
+            ["source"],
+            "Source",
+        ) if source_column_request else ""
+
+        prepared_splits = {
+            split: prepare_cleaner_audio_column(dataset, audio_column, Audio)
+            for split, dataset in split_map.items()
+        }
+
+        def add_metadata_defaults(row: dict) -> dict:
+            for key, default in AUGMENTATION_META_DEFAULTS.items():
+                if row.get(key) is None:
+                    row[key] = default
+            return row
+
+        enriched_splits = {
+            split: dataset.map(add_metadata_defaults)
+            for split, dataset in prepared_splits.items()
+        }
+
+        candidates: list[dict] = []
+        total_seconds = 0.0
+        eligible_seconds = 0.0
+        skipped: dict[str, int] = {}
+        source_counts: dict[str, int] = {}
+
+        for split in target_splits:
+            dataset = prepared_splits[split]
+            for index in range(len(dataset)):
+                row = dict(dataset[index])
+                source_value = str(row.get(source_column) or "") if source_column else ""
+                source_key = source_value or "<blank>"
+                source_counts[source_key] = source_counts.get(source_key, 0) + 1
+                duration = parse_duration_seconds(row.get(duration_column), duration_column) if duration_column else 0.0
+                if not row_matches_source_filters(row, source_column, include_terms, exclude_terms):
+                    skipped["source_filter"] = skipped.get("source_filter", 0) + 1
+                    continue
+                if not row.get(audio_column):
+                    skipped["missing_audio_value"] = skipped.get("missing_audio_value", 0) + 1
+                    continue
+                if duration <= 0:
+                    try:
+                        probe_audio, probe_sample_rate = audio_value_to_array(row.get(audio_column), dataset_path, site_root)
+                        probe_audio = helpers.to_mono(np.asarray(probe_audio, dtype=np.float32))
+                        duration = float(probe_audio.size / probe_sample_rate) if probe_sample_rate else 0.0
+                    except Exception as exc:
+                        skipped_key = f"audio_read_failed:{str(exc)[:80]}"
+                        skipped[skipped_key] = skipped.get(skipped_key, 0) + 1
+                        continue
+                if duration <= 0:
+                    skipped["invalid_duration"] = skipped.get("invalid_duration", 0) + 1
+                    continue
+                total_seconds += duration
+                eligible_seconds += duration
+                candidates.append(
+                    {
+                        "split": split,
+                        "row": index,
+                        "data": row,
+                        "duration": duration,
+                        "source": source_value,
+                        "used_types": set(),
+                        "copies": 0,
+                    }
+                )
+
+        if total_seconds <= 0:
+            raise RuntimeError("Could not measure dataset duration for augmentation.")
+        if not candidates:
+            source_preview = ", ".join(
+                f"{source}:{count}"
+                for source, count in sorted(source_counts.items(), key=lambda item: item[1], reverse=True)[:8]
+            )
+            skipped_preview = ", ".join(f"{reason}:{count}" for reason, count in sorted(skipped.items()))
+            raise RuntimeError(
+                "No eligible audio rows matched the augmentation filters. "
+                f"Skipped: {skipped_preview or 'none'}. "
+                f"Seen source values: {source_preview or 'none'}. "
+                f"Include contains: {include_terms or 'any'}. Exclude contains: {exclude_terms or 'none'}."
+            )
+
+        target_seconds = total_seconds * (target_extra_percent / 100.0)
+        transform_caps = {
+            name: eligible_seconds * (percent / 100.0)
+            for name, percent in coverage.items()
+            if percent > 0
+        }
+        transform_added = {name: 0.0 for name in transform_caps}
+        transform_counts = {name: 0 for name in transform_caps}
+        augmented_rows_by_split: dict[str, list[dict]] = {split: [] for split in split_map}
+        augmented_samples: list[dict] = []
+        added_seconds = 0.0
+        attempts = 0
+        max_attempts = max(100, len(candidates) * max_copies_per_original * 4)
+        noise_profiles = ["office", "call_center", "cafe", "street", "home"]
+        last_update = 0.0
+
+        update_cleaner_job(
+            job_id,
+            stage="Planning",
+            percent=10,
+            message=(
+                f"Eligible real-data audio: {eligible_seconds / 3600.0:.2f}h. "
+                f"Target augmented audio: {target_seconds / 3600.0:.2f}h."
+            ),
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "eligible_hours": round(eligible_seconds / 3600.0, 3),
+                "target_added_hours": round(target_seconds / 3600.0, 3),
+            },
+        )
+
+        while added_seconds < target_seconds and attempts < max_attempts:
+            attempts += 1
+            available_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate["copies"] < max_copies_per_original
+                and any(name not in candidate["used_types"] and transform_added[name] < transform_caps[name] for name in transform_caps)
+            ]
+            if not available_candidates:
+                break
+
+            candidate = rng.choice(available_candidates)
+            available_transforms = [
+                name
+                for name in transform_caps
+                if name not in candidate["used_types"] and transform_added[name] < transform_caps[name]
+            ]
+            if not available_transforms:
+                continue
+            weights = [max(transform_caps[name] - transform_added[name], 1.0) for name in available_transforms]
+            transform_type = rng.choices(available_transforms, weights=weights, k=1)[0]
+
+            try:
+                audio, sample_rate = audio_value_to_array(candidate["data"].get(audio_column), dataset_path, site_root)
+                audio = helpers.to_mono(np.asarray(audio, dtype=np.float32))
+            except Exception as exc:
+                skipped["audio_read_failed"] = skipped.get("audio_read_failed", 0) + 1
+                candidate["used_types"].add(transform_type)
+                continue
+
+            variant = transform_type
+            snr_db = 0.0
+            speed_factor = 0.0
+            gain_db = 0.0
+            if transform_type == "speed":
+                speed_factor = rng.choice([0.9, 1.1])
+                variant = f"{speed_factor:.1f}x"
+                augmented = speed_perturb_audio(audio, sample_rate, speed_factor, helpers)
+            elif transform_type == "noise":
+                profile = rng.choice(noise_profiles)
+                snr_db = rng.uniform(10.0, 25.0)
+                variant = f"{profile}_{snr_db:.1f}db"
+                augmented = add_profile_noise_at_snr(audio, sample_rate, rng, snr_db, profile, helpers)
+            elif transform_type == "reverb":
+                variant = "room"
+                augmented = helpers.add_room_reverb(audio, sample_rate, rng)
+            elif transform_type == "telephony":
+                variant = "8khz_bandpass_codec"
+                augmented = telephony_transform_audio(audio, sample_rate, rng, helpers)
+            elif transform_type == "gain":
+                augmented, gain_db = gain_transform_audio(audio, rng, helpers)
+                variant = f"{gain_db:+.1f}db"
+            else:
+                candidate["used_types"].add(transform_type)
+                continue
+
+            augmented = helpers.peak_limit(np.asarray(augmented, dtype=np.float32))
+            if augmented.size <= 0:
+                skipped["empty_augmented_audio"] = skipped.get("empty_augmented_audio", 0) + 1
+                candidate["used_types"].add(transform_type)
+                continue
+
+            new_duration = float(augmented.size / sample_rate) if sample_rate else candidate["duration"]
+            source_id = bad_sample_identity(candidate["data"]) or f"{candidate['split']}-{candidate['row']}"
+            safe_source = safe_slug(source_id, candidate["split"], str(candidate["row"]))
+            filename = f"{safe_source}_{transform_type}_{uuid.uuid4().hex[:8]}.wav"
+            output_audio_path = audio_output_dir / filename
+            sf.write(str(output_audio_path), augmented, sample_rate)
+
+            augmented_row = dict(candidate["data"])
+            augmented_row[audio_column] = str(output_audio_path)
+            if duration_column:
+                augmented_row[duration_column] = round(new_duration, 3)
+            for key, default in AUGMENTATION_META_DEFAULTS.items():
+                augmented_row.setdefault(key, default)
+            augmented_row["is_augmented"] = True
+            augmented_row["augmentation_id"] = f"aug_{transform_type}_{uuid.uuid4().hex[:10]}"
+            augmented_row["augmentation_type"] = transform_type
+            augmented_row["augmentation_variant"] = variant
+            augmented_row["augmentation_parent_id"] = source_id
+            augmented_row["augmentation_parent_split"] = candidate["split"]
+            augmented_row["augmentation_parent_row"] = int(candidate["row"])
+            augmented_row["augmentation_snr_db"] = round(snr_db, 2)
+            augmented_row["augmentation_speed_factor"] = round(speed_factor, 2)
+            augmented_row["augmentation_gain_db"] = round(gain_db, 2)
+
+            augmented_rows_by_split[candidate["split"]].append(augmented_row)
+            candidate["used_types"].add(transform_type)
+            candidate["copies"] += 1
+            transform_added[transform_type] += new_duration
+            transform_counts[transform_type] += 1
+            added_seconds += new_duration
+            augmented_samples.append(
+                {
+                    "split": candidate["split"],
+                    "row": candidate["row"],
+                    "id": source_id,
+                    "source": candidate["source"],
+                    "augmentation_type": transform_type,
+                    "variant": variant,
+                    "duration_seconds": round(new_duration, 3),
+                    "audio_path": str(output_audio_path),
+                }
+            )
+
+            now = time.time()
+            if now - last_update >= 1.2 or added_seconds >= target_seconds:
+                percent = 12 + min(76, (added_seconds / target_seconds) * 76)
+                update_cleaner_job(
+                    job_id,
+                    stage="Creating augmentations",
+                    percent=round(percent, 1),
+                    message=(
+                        f"Added {added_seconds / 3600.0:.2f}h/{target_seconds / 3600.0:.2f}h "
+                        f"across {sum(transform_counts.values())} augmented copy/copies."
+                    ),
+                    result={
+                        "input_path": str(dataset_path),
+                        "output_path": str(output_path),
+                        "added_hours": round(added_seconds / 3600.0, 3),
+                        "target_added_hours": round(target_seconds / 3600.0, 3),
+                        "augmented_rows": sum(transform_counts.values()),
+                        "transform_counts": transform_counts,
+                    },
+                )
+                last_update = now
+
+        combined_splits = {}
+        original_rows_by_split = {split: len(dataset) for split, dataset in split_map.items()}
+        augmented_rows_by_split_count: dict[str, int] = {}
+        for split, dataset in enriched_splits.items():
+            rows = augmented_rows_by_split.get(split, [])
+            augmented_rows_by_split_count[split] = len(rows)
+            if rows:
+                augmented_dataset = Dataset.from_list(rows, features=dataset.features)
+                combined_splits[split] = concatenate_datasets([dataset, augmented_dataset])
+            else:
+                combined_splits[split] = dataset
+
+        augmented_dataset = combined_splits["train"] if single_dataset else DatasetDict(combined_splits)
+        total_augmented_rows = sum(augmented_rows_by_split_count.values())
+
+        update_cleaner_job(
+            job_id,
+            stage="Saving",
+            percent=92,
+            message=f"Saving augmented dataset to {output_path}",
+            result={
+                "input_path": str(dataset_path),
+                "output_path": str(output_path),
+                "added_hours": round(added_seconds / 3600.0, 3),
+                "augmented_rows": total_augmented_rows,
+                "transform_counts": transform_counts,
+            },
+        )
+
+        save_cleaner_dataset(augmented_dataset, output_path, output_mode, site_root, pipeline_dir)
+
+        report_path = augmentation_report_path(output_path)
+        result = {
+            "input_path": str(dataset_path),
+            "output_path": str(output_path),
+            "output_mode": output_mode,
+            "report_path": str(report_path),
+            "audio_output_dir": str(audio_output_dir),
+            "target_extra_percent": target_extra_percent,
+            "target_added_hours": round(target_seconds / 3600.0, 3),
+            "added_hours": round(added_seconds / 3600.0, 3),
+            "base_hours": round(total_seconds / 3600.0, 3),
+            "eligible_hours": round(eligible_seconds / 3600.0, 3),
+            "augmented_rows": total_augmented_rows,
+            "original_rows_by_split": original_rows_by_split,
+            "augmented_rows_by_split": augmented_rows_by_split_count,
+            "transform_counts": transform_counts,
+            "transform_added_hours": {
+                name: round(seconds / 3600.0, 3)
+                for name, seconds in transform_added.items()
+            },
+            "coverage_percent": coverage,
+            "source_column": source_column,
+            "include_source_terms": include_terms,
+            "exclude_source_terms": exclude_terms,
+            "max_copies_per_original": max_copies_per_original,
+            "random_seed": seed,
+            "skipped": skipped,
+            "augmented_samples_preview": augmented_samples[:25],
+        }
+        report_payload = dict(result)
+        report_payload["augmented_samples"] = augmented_samples
+        report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        DatasetViewerHandler.dataset_cache.clear()
+        DatasetViewerHandler.dataset_path = output_path
+
+        update_cleaner_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Added {added_seconds / 3600.0:.2f}h in {total_augmented_rows} augmented row(s). Dataset: {output_path}",
+            result=result,
+        )
+    except Exception as exc:
+        update_cleaner_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Data augmentation failed.",
+            error=str(exc),
+            log_tail=str(exc),
+            result={"output_path": str(output_path) if output_path else ""},
+        )
+
+
+def resolve_project_path(path_value: str, site_root: Path, pipeline_dir: Path) -> Path:
+    raw = Path(str(path_value or "").strip()).expanduser()
+    if raw.is_absolute():
+        return raw
+
+    candidates = [
+        site_root / raw,
+        pipeline_dir / raw,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def resolve_pipeline_output(path_value: str, pipeline_dir: Path) -> Path:
+    raw = Path(str(path_value or "").strip()).expanduser()
+    if raw.is_absolute():
+        return raw
+    return (pipeline_dir / raw).resolve()
+
+
+def count_jsonl_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def count_audio_files(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for item in path.glob("*.wav") if item.is_file())
+
+
+def read_tail(path: Path, limit: int = 5000) -> str:
+    if not path.exists():
+        return ""
+    data = path.read_bytes()
+    return data[-limit:].decode("utf-8", errors="replace")
+
+
+def prepare_runtime_config(job_id: str, params: dict, site_root: Path, pipeline_dir: Path) -> tuple[Path, dict]:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("Install PyYAML before starting generation: pip install pyyaml") from exc
+
+    config_path = resolve_project_path(
+        params.get("config_path") or "synthetic_cs_dataset/configs/generation.yaml",
+        site_root,
+        pipeline_dir,
+    )
+    if not config_path.exists():
+        raise RuntimeError(f"Config file not found: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+
+    text_config = config.setdefault("text_generation", {})
+    audio_config = config.setdefault("audio_generation", {})
+    review_config = config.setdefault("review", {})
+
+    num_texts = int(params.get("num_texts") or text_config.get("num_texts") or 1)
+    batch_size = int(params.get("batch_size") or text_config.get("batch_size") or 40)
+    target_hours = float(params.get("target_hours") or audio_config.get("target_hours") or 12)
+    augmentation_probability = float(
+        params.get("augmentation_probability")
+        if params.get("augmentation_probability") is not None
+        else audio_config.get("augmentation_probability", 0.0)
+    )
+    output_dir = str(params.get("output_dir") or audio_config.get("output_dir") or "data").strip()
+    reference_dir = str(
+        params.get("reference_speakers_dir")
+        or audio_config.get("reference_speakers_dir")
+        or "data/reference_speakers"
+    ).strip()
+
+    if num_texts < 1 or num_texts > 30000:
+        raise RuntimeError("num_texts must be between 1 and 30000.")
+    if batch_size < 1:
+        raise RuntimeError("batch_size must be at least 1.")
+    if target_hours <= 0:
+        raise RuntimeError("target_hours must be greater than 0.")
+    if not 0 <= augmentation_probability <= 1:
+        raise RuntimeError("augmentation_probability must be between 0 and 1.")
+
+    audio_subdir = str(audio_config.get("audio_subdir", "audio"))
+    text_output_path = resolve_pipeline_output(f"{output_dir}/texts.jsonl", pipeline_dir)
+    text_config["num_texts"] = num_texts
+    text_config["batch_size"] = batch_size
+    text_config["resume"] = count_jsonl_lines(text_output_path) > 0
+    text_config["output_path"] = f"{output_dir}/texts.jsonl"
+    audio_config["texts_path"] = f"{output_dir}/texts.jsonl"
+    audio_config["output_dir"] = output_dir
+    audio_config["logs_dir"] = f"{output_dir}/generation_logs"
+    audio_config["target_hours"] = target_hours
+    audio_config["augmentation_probability"] = augmentation_probability
+    audio_config["reference_speakers_dir"] = reference_dir
+    review_config["output_path"] = f"{output_dir}/review_samples.csv"
+
+    runtime_path = pipeline_dir / "configs" / f"runtime_generation_{job_id}.yaml"
+    with runtime_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
+
+    paths = {
+        "num_texts": num_texts,
+        "target_hours": target_hours,
+        "config_path": runtime_path,
+        "text_output_path": resolve_pipeline_output(text_config["output_path"], pipeline_dir),
+        "audio_dir": resolve_pipeline_output(f"{output_dir}/{audio_subdir}", pipeline_dir),
+        "log_path": resolve_pipeline_output(f"{output_dir}/generation_logs/web_generation_{job_id}.log", pipeline_dir),
+        "output_dir": resolve_pipeline_output(output_dir, pipeline_dir),
+    }
+    paths["log_path"].parent.mkdir(parents=True, exist_ok=True)
+    return runtime_path, paths
+
+
+def run_tracked_command(job_id: str, command: list[str], cwd: Path, log_path: Path, progress_callback) -> None:
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write("\n$ " + " ".join(command) + "\n")
+        log.flush()
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        while process.poll() is None:
+            progress_callback()
+            time.sleep(2)
+        progress_callback()
+        if process.returncode != 0:
+            raise RuntimeError(read_tail(log_path) or f"Command failed with exit code {process.returncode}.")
+
+
+def run_generation_job(job_id: str, params: dict, site_root: Path) -> None:
+    pipeline_dir = site_root / "synthetic_cs_dataset"
+    try:
+        update_generation_job(job_id, status="running", stage="Preparing", percent=2, message="Preparing runtime config.")
+        runtime_config, paths = prepare_runtime_config(job_id, params, site_root, pipeline_dir)
+        log_path = paths["log_path"]
+        num_texts = max(1, int(paths["num_texts"]))
+
+        update_generation_job(
+            job_id,
+            stage="Text generation",
+            percent=5,
+            message=f"Generating {num_texts} transcript row(s).",
+            log_tail=str(log_path),
+        )
+
+        def text_progress() -> None:
+            accepted = count_jsonl_lines(paths["text_output_path"])
+            percent = 5 + min(40, (accepted / num_texts) * 40)
+            update_generation_job(
+                job_id,
+                percent=round(percent, 1),
+                message=f"Text rows accepted: {accepted}/{num_texts}",
+                log_tail=read_tail(log_path),
+            )
+
+        run_tracked_command(
+            job_id,
+            [
+                sys.executable,
+                "scripts/generate_texts.py",
+                "--config",
+                str(runtime_config),
+                "--num-texts",
+                str(num_texts),
+                "--batch-size",
+                str(params.get("batch_size") or 40),
+            ],
+            pipeline_dir,
+            log_path,
+            text_progress,
+        )
+
+        update_generation_job(
+            job_id,
+            stage="Audio generation",
+            percent=50,
+            message=f"Generating audio toward {paths['target_hours']} target hour(s).",
+            log_tail=read_tail(log_path),
+        )
+
+        def audio_progress() -> None:
+            audio_count = count_audio_files(paths["audio_dir"])
+            percent = 50 + min(45, (audio_count / num_texts) * 45)
+            update_generation_job(
+                job_id,
+                percent=round(percent, 1),
+                message=f"Audio files written: {audio_count}",
+                log_tail=read_tail(log_path),
+            )
+
+        run_tracked_command(
+            job_id,
+            [
+                sys.executable,
+                "scripts/generate_audio.py",
+                "--config",
+                str(runtime_config),
+                "--target-hours",
+                str(paths["target_hours"]),
+            ],
+            pipeline_dir,
+            log_path,
+            audio_progress,
+        )
+
+        update_generation_job(
+            job_id,
+            status="completed",
+            stage="Completed",
+            percent=100,
+            message=f"Generation finished. Output folder: {paths['output_dir']}",
+            log_tail=read_tail(log_path),
+        )
+    except Exception as exc:
+        log_tail = ""
+        try:
+            log_tail = read_tail(paths["log_path"])  # type: ignore[name-defined]
+        except Exception:
+            pass
+        update_generation_job(
+            job_id,
+            status="failed",
+            stage="Failed",
+            percent=100,
+            message="Generation failed.",
+            error=str(exc),
+            log_tail=log_tail or str(exc),
+        )
+
+
+def load_audio_cell(path: Path, split: str, row_index: int, column: str):
+    try:
+        from datasets import Audio, Dataset, DatasetDict, load_from_disk
+    except ImportError as exc:
+        raise RuntimeError("Install the `datasets` package on Lightning to read audio rows.") from exc
+
+    loaded = load_from_disk(str(path))
+    if isinstance(loaded, DatasetDict):
+        if split not in loaded:
+            raise FileNotFoundError(f"Split not found: {split}")
+        dataset = loaded[split]
+    elif isinstance(loaded, Dataset):
+        dataset = loaded
+    else:
+        raise RuntimeError(f"Unsupported dataset type at {path}")
+
+    if column not in dataset.column_names:
+        raise FileNotFoundError(f"Audio column not found: {column}")
+    if row_index < 0 or row_index >= len(dataset):
+        raise FileNotFoundError(f"Row not found: {row_index}")
+
+    feature = getattr(dataset, "features", {}).get(column)
+    if feature and feature.__class__.__name__ == "Audio":
+        dataset = dataset.cast_column(column, Audio(decode=False))
+
+    return dataset[row_index][column]
+
+
+def dataset_payload(name: str, dataset, root: Path, max_rows: int, audio_type) -> dict:
+    prepared = prepare_audio_columns(dataset, audio_type)
+    audio_columns = get_audio_columns(prepared)
+    row_count = len(prepared)
+    limit = row_count if max_rows <= 0 else min(max_rows, row_count)
+    records = []
+
+    for index in range(limit):
+        record = clean_value(prepared[index])
+        record["_split"] = name
+        record["_row"] = index
+        for column in audio_columns:
+            record[f"_play_{column}"] = (
+                f"./api/audio-row?split={quote(name)}&row={index}&column={quote(column)}"
+            )
+        records.append(record)
+
+    label = f"{root.name} {name}".strip()
+    if max_rows > 0 and row_count > max_rows:
+        label = f"{label} preview"
+
+    return {
+        "name": label,
+        "path": f"{root}/{name}",
+        "records": records,
+        "rows": row_count,
+        "shownRows": limit,
+        "final": "final" in str(root).lower() or "clean" in str(root).lower(),
+    }
+
+
+def prepare_audio_columns(dataset, audio_type):
+    prepared = dataset
+    for column, feature in getattr(dataset, "features", {}).items():
+        if feature.__class__.__name__ == "Audio":
+            prepared = prepared.cast_column(column, audio_type(decode=False))
+    return prepared
+
+
+def get_audio_columns(dataset) -> list[str]:
+    columns = []
+    for column, feature in getattr(dataset, "features", {}).items():
+        if feature.__class__.__name__ == "Audio":
+            columns.append(column)
+    return columns
+
+
+def clean_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        return f"[bytes:{len(value)}]"
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if key == "bytes":
+                continue
+            cleaned[str(key)] = clean_value(item)
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        if len(value) > 24:
+            return f"[array:{len(value)} items]"
+        return [clean_value(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return clean_value(value.item())
+        except Exception:
+            pass
+    if hasattr(value, "shape"):
+        shape = "x".join(str(part) for part in value.shape)
+        return f"[array:{shape}]"
+    return str(value)
+
+
+def parse_smoke_error(stdout: str) -> str:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return ""
+    if isinstance(payload, dict):
+        error = str(payload.get("error") or "")
+        nested = parse_nested_smoke_error(error)
+        return nested or friendly_smoke_error(error) or error
+    return ""
+
+
+def parse_nested_smoke_error(error: str) -> str:
+    try:
+        payload = json.loads(error)
+    except json.JSONDecodeError:
+        return friendly_smoke_error(error)
+    if not isinstance(payload, dict):
+        return friendly_smoke_error(error)
+    stderr = str(payload.get("stderr") or "").strip()
+    stdout = str(payload.get("stdout") or "").strip()
+    text = stderr or stdout or error
+    return friendly_smoke_error(text) or text
+
+
+def friendly_smoke_error(text: str) -> str:
+    if "No speaker references found" in text:
+        return (
+            "No OmniVoice reference speaker was found. Put a WAV file in "
+            "`synthetic_cs_dataset/data/reference_speakers/` with a matching `.txt` transcript, "
+            "or fill the Quick Test reference audio path and reference text fields. "
+            "The reference audio path can be absolute, or relative to `synthetic_cs_dataset/`."
+        )
+    return ""
+
+
+def is_allowed_audio_path(path: Path, dataset_root: Path) -> bool:
+    if path.suffix.lower() not in AUDIO_EXTENSIONS:
+        return False
+    try:
+        path.relative_to(dataset_root)
+        return True
+    except ValueError:
+        return False
+
+
+def main() -> None:
+    args = parse_args()
+    handler = DatasetViewerHandler
+    handler.dataset_path = args.dataset_path
+    handler.max_rows = args.max_rows
+    handler.site_root = Path(__file__).resolve().parent
+
+    with ThreadingHTTPServer((args.host, args.port), handler) as server:
+        print(f"Serving viewer on http://{args.host}:{args.port}/")
+        print(f"Reading dataset from {args.dataset_path}")
+        print("Synthetic smoke test endpoint: /api/synthetic-test")
+        server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
